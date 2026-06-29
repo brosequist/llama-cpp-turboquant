@@ -424,12 +424,19 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible.
-            // For turbo types, the check is compiled out: at typical decode context lengths
-            // (< ~4K tokens) with threshold 1e-6, no positions are ever skipped, so the
-            // per-position branch is pure overhead (misprediction + comparison cost). This
-            // also dodges the warp-divergence regression on turbo paths that motivated the
-            // April 24 revert (commit f2dc968).
-            if constexpr (!V_is_turbo) {
+            // Previously compiled out for turbo types based on the kernel-author observation
+            // that at <4K context with threshold 1e-6, ~0% of positions are skipped — so the
+            // branch is pure overhead in that regime. The April 24 attempt (commit f2dc968)
+            // also caused a warp-divergence regression and was reverted.
+            //
+            // Re-enabled here for turbo. Safety: on the turbo path KQ_k[j] is set via
+            // __shfl_sync (line 408) from KQ_reg[j], so all 32 threads in the warp see the
+            // SAME value — the predicate is warp-uniform, no divergence. At long context
+            // (>~16K) softmax mass concentrates on a small subset of positions, making the
+            // skip rate non-trivial and the branch worth its cost. The short-context cost is
+            // ~5 cycles per warp-iteration (predicate + branch), negligible vs the dequant +
+            // accumulate work skipped when the predicate fires.
+            {
                 bool dominated = true;
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
@@ -473,8 +480,10 @@ static __global__ void flash_attn_ext_vec(
             }
 
             // Sparse V: skip V dequant if all attention weights for this position are negligible.
-            // Compiled out for turbo types — see half2 path comment above.
-            if constexpr (!V_is_turbo) {
+            // Re-enabled for turbo — see warp-uniform-safety note on half2 path above.
+            // KQ_k[j] on turbo is set via __shfl_sync (line 458), so the predicate is
+            // warp-uniform and the branch does not cause divergence.
+            {
                 bool dominated = true;
 #pragma unroll
                 for (int j = 0; j < ncols; ++j) {
