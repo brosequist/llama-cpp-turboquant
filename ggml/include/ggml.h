@@ -2613,6 +2613,7 @@ extern "C" {
     //     the recurrence already passes through that exact intermediate value on its way to the
     //     final state, so capturing it here is free relative to a separate K=1 call over the same
     //     prefix. Omitted (and not counted in the output size) when n_tokens <= K.
+    // when n_tokens > K only slot 0 is guaranteed; backends may leave slots 1..K-1 unwritten.
     GGML_API struct ggml_tensor * ggml_gated_delta_net(
             struct ggml_context * ctx,
             struct ggml_tensor  * q,

@@ -4650,6 +4650,28 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET with K > 1 and n_seq_tokens > K: only the attention output and slot 0
+// (the final state) are specified (ggml.h), so compare just those. Covers the prefill shape of
+// MTP/spec-decode servers, where the MMA path writes the final state only.
+struct test_gated_delta_net_slot0 : public test_gated_delta_net {
+    using test_gated_delta_net::test_gated_delta_net;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET_SLOT0";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_ASSERT(emit_mode == 0 && K > 1 && n_seq_tokens > K);
+        ggml_tensor * out = test_gated_delta_net::build_graph(ctx);
+        const int64_t H_v = head_count * v_repeat;
+        const int64_t n   = head_size * H_v * n_seq_tokens * n_seqs + head_size * head_size * H_v * n_seqs;
+        return ggml_cont(ctx, ggml_view_1d(ctx, out, n, 0));
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -10982,6 +11004,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  33, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1, 1, false, true));
 
+    // MMA-eligible GDN shapes: whole heads, value slices, tails, and the HIP prefill threshold.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   65, 3, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,   64, 1, 4));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  257, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  512, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  513, 2, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
+    // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+    // fork: qwen3.8 MTP prefill shape (H_k 16, H_v 48, ub 256, K = n_rs_seq + 1), final state only
+    test_cases.emplace_back(new test_gated_delta_net_slot0(GGML_TYPE_F32, 16, 128,  256, 1, 3, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_slot0(GGML_TYPE_F32, 16, 128,   97, 2, 3, false, false, /*K=*/4));
+    test_cases.emplace_back(new test_gated_delta_net_slot0(GGML_TYPE_F32, 16, 128, 1024, 1, 3, false, false, /*K=*/4));
+
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
     // exact-match cases (K == n_seq_tokens):
@@ -10991,9 +11029,6 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  4, 1, 1, false, false, /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32,   4, 2, 2, false, true,  /*K=*/4));
-    // overflow: n_tokens > K — only the last K snapshots kept.
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3));
-    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  16, 2, 1, false, false, /*K=*/4));
 
     // emit_mode == 1 (replay ingredients): CPU-only for now (see ggml_backend_cuda_device_supports_op).
     // Same shape matrix as the K > 1 block above -- sanity-checks the ingredient path builds,
@@ -11431,6 +11466,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // fork: qwen3.8 shape (H_k 16, H_v 48), MMA threshold sweep
+    for (int64_t n : {32, 64, 128, 256, 512, 1024, 2048, 4096}) {
+        test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n, 1, 3));
+    }
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256
