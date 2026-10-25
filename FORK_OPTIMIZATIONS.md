@@ -14,31 +14,38 @@ process**, serving through llama-swap in a k3s cluster.
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is the 2026-10-25 release candidate (`deploy/rocm101-stack`), measured in a test pod; production numbers
-will replace these once it is deployed.
+this work, without MTP. **After** is `deploy/rocm101-stack`, deployed 2026-10-25, measured back-to-back with the
+previous build under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| Decode, code prompt (t/s) | ~21 (no speculation) | **51.9** | **~2.5×** |
-| Decode, prose prompt (t/s) | ~21 | **41.3** | ~2.0× |
-| Decode, 9.3K-token summarisation (t/s) | ~21 | **38.9** | ~1.85× |
-| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **1611** | ~2.0× |
-| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **1379** | ~1.8× |
+| Decode, code prompt (t/s) | ~21 (no speculation) | **46.6** | **~2.2×** |
+| Decode, prose prompt (t/s) | ~21 | **37.1** | ~1.8× |
+| Decode, 9.3K-token summarisation (t/s) | ~21 | **35.0** | ~1.7× |
+| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **~1520** | ~1.9× |
+| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **1310–1320** | ~1.75× |
 | Prefill @ 64K context depth (t/s) | 223 | 492 | 2.2× |
 | Prefill @ 224K context depth (t/s) | 152 | 383 | 2.5× |
 | KL divergence vs f16 KV (turbo4) | 0.0080 | 0.0065 | lower is better |
-| VRAM, navi44 / navi48 (GB) | 14.3 / 10.8 (unbalanced) | 13.5 / 14.2 | balanced; ~2 GB headroom each |
+| VRAM, navi44 / navi48 (GB) | 14.3 / 10.8 (unbalanced) | 13.5 / 12.9 | balanced; ~2.5 GB headroom each |
 
 North-Mini-Code: decode at long context with the q8_0 KV cache, `llama-bench tg64`.
 
 | Context depth | Before (t/s) | After (t/s) | Change |
 |---|---:|---:|---:|
-| 32K | 41.5 | 52.6 | +27% |
-| 64K | 36.3 | 48.7 | +34% |
-| 128K | 25.5 | 42.8 | +68% |
+| 32K | 31.9 | 46.5 | +46% |
+| 64K | 23.8 | 43.3 | +82% |
 
-The north "before" column is already on ROCm 10.1, so the table isolates [#30803](https://github.com/ggml-org/llama.cpp/pull/30803). North was also unable to run
-dual-GPU at all before the mixed-arch fixes in the next section.
+Before is the previous production build (`rocm-db6212f`, ROCm 7.2.1), after is the deployed build, back to back. Most of
+the gain is [#30803](https://github.com/ggml-org/llama.cpp/pull/30803): on ROCm 10.1 alone it measured 41.5 → 52.6 @32K,
+36.3 → 48.7 @64K and 25.5 → 42.8 @128K. North was also unable to run dual-GPU at all before the mixed-arch fixes in the
+next section.
+
+> **navi48 clocks skew measurements.** navi48 also drives the desktop. While a desktop session was active it held
+> about 1.3 GB more VRAM and kept the GPU out of its deep idle states, and the same binaries ran 5–12% faster
+> (9.3K prefill 1379 vs 1312 t/s, code decode 51.9 vs 46.6). Comparisons in this document come from runs taken
+> back-to-back under one condition; an earlier ROCm 10.1 result (+5.6% prefill, +11–20% decode) did not hold up
+> under that rule and is corrected below.
 
 > **Methodology.** Decode numbers are temperature 0, 700-token completions through llama-server's
 > `/v1/chat/completions`, using three prompts: a 9.3K-token wikitext summary, a Python coding task and a 300-word
@@ -70,7 +77,7 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **Row-per-warp GATED_DELTA_NET kernel**, a port of [#22587](https://github.com/ggml-org/llama.cpp/pull/22587) onto TheTom's keep_rs/checkpoint contract (ours). It is also closer to a CPU-reference GDN: KLD 0.0046 vs 0.0071 | pp4096 / 9.3K with MTP | 1450 / 1064 | 1491 / 1083 |
 | **`-b 8192`** (was 1024). MTP reads `h_nextn` back after every batch, which drains the layer-split pipeline; navi48 then idles and down-clocks to ~1.6 GHz | 9.3K with MTP | 1084 | 1306 |
 | **MTP: keep only the last `h_nextn` row for prompt batches** (ours). Every row was being copied into a buffer that is only read for verify batches | 9.3K with MTP | 1291 | 1309 |
-| **ROCm 7.2.1 → 10.1.0** base image (TheRock build) | pp4096 / 9.3K with MTP | 1518 / 1309 | 1606 / 1382 |
+| **ROCm 7.2.1 → 10.1.0** base image (TheRock build) + batch-1 cherry-picks, same conditions | 9.3K with MTP | 1307 | 1303–1321 (flat) |
 
 ### Decode
 
@@ -79,8 +86,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **MTP self-speculation** (`--spec-type draft-mtp`, NextN head from the main GGUF) | code / prose | 21.5 / ~21 | 41.5 / 32.4 |
 | **`--tensor-split 1.2,1`** | summary / code / prose | 29.98 / 40.76 / 33.37 | 32.63 / 41.01 / 34.63 |
 | ggml-org **[#31037](https://github.com/ggml-org/llama.cpp/pull/31037)** port: trimmed MTP draft head (`LLAMA_MTP_DRAFT_VOCAB=65536`). The draft only proposes ids below 65536 and the target still verifies, so output is unaffected | summary / code / prose | 32.63 / 41.01 / 34.63 | 34.72 / 45.56 / 37.13 |
-| **ROCm 7.2.1 → 10.1.0** | summary / code / prose | 32.5 / 47.1 / 34.5 | 38.0 / 52.4 / 41.4 |
-| **[#30803](https://github.com/ggml-org/llama.cpp/pull/30803) port**: RDNA4 block-per-lane q8_0/q4_0 K plus GQA head batching in the vec FA kernel. North only; see the table above | North @128K | 25.5 | 42.8 |
+| **ROCm 7.2.1 → 10.1.0** + batch 1, same conditions | summary / code / prose | 33.1 / 48.1 / 35.1 | 35.0 / 46.6 / 37.1 |
+| **[#30803](https://github.com/ggml-org/llama.cpp/pull/30803) port**: RDNA4 block-per-lane q8_0/q4_0 K plus GQA head batching in the vec FA kernel. North only; see the table above | North @64K | 23.8 | 43.3 |
 
 ### Mainline cherry-picks (batch 1: correctness and security)
 
