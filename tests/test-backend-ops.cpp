@@ -10979,6 +10979,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   4, 1, 1, false, false, /*K=*/4, /*emit_mode=*/1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,   4, 2, 1, false, true,  /*K=*/4, /*emit_mode=*/1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32,   8, 1, 1, false, false, /*K=*/3, /*emit_mode=*/1));
+    // production shape (qwen3.8: S_v=128): ingredient slots + pre-window checkpoint, and KDA snapshots
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128,  8, 1, 1, false, false, /*K=*/3, /*emit_mode=*/1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 128, 16, 2, 1, false, true,  /*K=*/4));
+    // qwen3.8 prefill ubatch shape: 16 q/k heads x v_repeat 3 = 48 v heads, S_v=128, 256 tokens
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 256, 1, 3, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128,  37, 1, 3));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging
