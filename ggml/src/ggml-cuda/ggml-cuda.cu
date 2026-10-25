@@ -5177,7 +5177,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
-    if (node->op == GGML_OP_MUL) {
+    // fork: GGML_CUDA_MOE_WEIGHTED_REDUCTION=0 disables this fusion alone (A/B against the elementwise chain)
+    static const bool moe_wr_off = getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION") != nullptr &&
+                                   std::atoi(getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION")) == 0;
+    if (node->op == GGML_OP_MUL && !moe_wr_off) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
