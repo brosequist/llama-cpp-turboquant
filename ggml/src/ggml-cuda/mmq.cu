@@ -12,7 +12,7 @@
 // can use their existing fallback instead of reaching J_best == 0 and aborting.
 bool ggml_cuda_mmq_has_config(
         const ggml_type type, const int64_t nrows_x, const int cc, const size_t smpbo) {
-    const bool fallback = nrows_x % 128 != 0;
+    const bool fallback = ggml_cuda_mmq_needs_fallback(nrows_x);
 
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
@@ -22,6 +22,45 @@ bool ggml_cuda_mmq_has_config(
     }
 
     return false;
+}
+
+// Pick the MMQ tile width J for ncols columns. Done on the host before src1/ids_dst are
+// allocated so their padding can be sized for the tile that will actually be launched
+// (port of ggml-org #29953: the previous J_max-based padding rounded ncols DOWN to a
+// multiple of 8, so e.g. 1-7 columns got zero padding while J=8 tiles were loaded).
+static void ggml_cuda_mmq_pick_J(
+        const ggml_type type, const bool fallback, const int cc, const size_t smpbo, const int64_t ncols,
+        int & J_best, int & nthreads_best) {
+    J_best        = 0;
+    nthreads_best = 0;
+    int ntiles_J_best = INT_MAX;
+
+    for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type == GGML_TYPE_COUNT) {
+            continue;
+        }
+
+        if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+            continue;
+        }
+
+        const int ntiles_x = (ncols + config.J - 1) / config.J;
+
+        if (ntiles_x < ntiles_J_best) {
+            J_best        = J;
+            nthreads_best = config.nthreads;
+            ntiles_J_best = ntiles_x;
+        }
+    }
+    GGML_ASSERT(J_best > 0);
+}
+
+// A tile of width J can read up to J - 1 columns past the last valid one, and the y tile is
+// loaded nthreads ints at a time, so pad by one full tile rounded up to that load chunk.
+static size_t ggml_cuda_mmq_src1_padding(const int J_best, const int nthreads_best) {
+    const size_t chunk = nthreads_best * sizeof(int);
+    return ((J_best * sizeof(block_q8_1_mmq) + chunk - 1) / chunk) * chunk;
 }
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
@@ -150,15 +189,21 @@ void ggml_cuda_mul_mat_q(
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
-    const bool fallback = ne01 % 128 != 0;
+    const bool fallback = ggml_cuda_mmq_needs_fallback(ne01);
+    const size_t smpbo  = ggml_cuda_info().devices[ggml_cuda_get_device()].smpbo;
 
     const bool use_native_fp4 = blackwell_mma_available(cc) && (src0->type == GGML_TYPE_MXFP4 || src0->type == GGML_TYPE_NVFP4);
     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
 
+    int J_best        = 0;
+    int nthreads_best = 0;
+    // ncols_max as passed in mmq_args below: ne1 for dense, ne12 for MoE.
+    ggml_cuda_mmq_pick_J(src0->type, fallback, cc, smpbo, ids ? ne12 : ne1, J_best, nthreads_best);
+    const size_t src1_q8_1_padding = ggml_cuda_mmq_src1_padding(J_best, nthreads_best);
+
     if (!ids) {
-        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+        const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -199,7 +244,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, J_best};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -213,7 +258,7 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + J_best-1); // Padded: the kernel reads a full J tile unconditionally.
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -230,8 +275,7 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
-    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+    const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block + src1_q8_1_padding;
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -279,7 +323,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, J_best};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }
