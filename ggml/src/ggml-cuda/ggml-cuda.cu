@@ -2967,6 +2967,55 @@ static bool ggml_cuda_can_chunk_mmvf(ggml_backend_cuda_context & ctx,
 }
 
 
+static bool ggml_cuda_mul_mat_bad_padding_clear(const ggml_tensor * src) {
+    return ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_nbytes(src) != ggml_backend_buffer_get_alloc_size(src->buffer, src) && src->view_src;
+}
+
+static bool ggml_cuda_tensors_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const char * a0 = (const char *) a->data;
+    const char * b0 = (const char *) b->data;
+    return a0 < b0 + ggml_nbytes(b) && b0 < a0 + ggml_nbytes(a);
+}
+
+// Fused gate/up/GLU on the MMQ path (port of ggml-org #28702).
+static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    const ggml_tensor * x_up = up->src[0];
+    const ggml_tensor * y    = up->src[1];
+
+    if (up->op != GGML_OP_MUL_MAT || !ggml_cuda_mmq_fusion_supported(x_up->type) || y->type != GGML_TYPE_F32 || y->ne[1] <= 1 ||
+            glu->type != GGML_TYPE_F32 ||
+            ggml_get_op_params_i32(up, 1) != GGML_HINT_NONE || ggml_get_op_params_i32(gate, 1) != GGML_HINT_NONE) {
+        return false;
+    }
+
+    if (!ggml_cuda_should_fuse_mul_mat(up, gate, glu)) {
+        return false;
+    }
+
+    // The fused write-back applies SWIGLU_OAI with the default alpha and limit of ggml_cuda_op_swiglu_oai_single.
+    if (ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_OAI &&
+            (ggml_get_op_params_f32(glu, 2) != 1.702f || ggml_get_op_params_f32(glu, 3) != 7.0f)) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    if (!(turing_mma_available(cc) || amd_mfma_available(cc) || amd_wmma_available(cc)) ||
+            ggml_cuda_should_use_mmvq(x_up->type, cc, y->ne[1]) || !ggml_cuda_should_use_mmq(x_up->type, cc, y->ne[1], 0)) {
+        return false;
+    }
+
+    if (ggml_cuda_mul_mat_bad_padding_clear(x_up) || ggml_cuda_mul_mat_bad_padding_clear(gate->src[0])) {
+        return false;
+    }
+
+    // Upstream extends the activation/weight lifetimes to the GLU node via graph_optimize alloc deps, which this
+    // fork's backend API lacks: the allocator may hand the GLU output memory that y (or a weight copy) occupied,
+    // since in the unfused graph they are dead by then. Check at compute time and stay unfused if so.
+    return !ggml_cuda_tensors_overlap(glu, y) && !ggml_cuda_tensors_overlap(glu, x_up) &&
+           !ggml_cuda_tensors_overlap(glu, gate->src[0]);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0_, const ggml_tensor * src1_, ggml_tensor * dst) {
     // Q8_CR weights are stored rotated: rotate the activations with the same
     // matrix and run the standard Q8_0 kernels (the rotations cancel)
@@ -3096,9 +3145,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // If src0 is a temporary compute buffer it may have some padding that needs to be cleared for mul_mat_vec_q or mul_mat_q.
     // But if src0 is also a view of another tensor then this cannot be done safely because it may overwrite valid tensor data.
     // Therefore, in such cases use cuBLAS.
-    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
-        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
-    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+    if (ggml_cuda_mul_mat_bad_padding_clear(src0) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -5527,6 +5574,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 cuda_ctx->fusion_stats.mul_mat_glu++;
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data);
+                fused_mul_mat_vec = true;
+                fused_node_count  = 3;
+                break;
+            }
+
+            if (ggml_cuda_should_fuse_mul_mat_q(up, gate, glu)) {
+                ggml_cuda_mm_fusion_args_host fusion_data{};
+                fusion_data.gate      = gate->src[0];
+                fusion_data.glu_op    = ggml_get_glu_op(glu);
+                fusion_data.glu_limit = ggml_get_op_params_f32(glu, 3);
+
+                cuda_ctx->fusion_stats.mul_mat_glu++;
+                ggml_cuda_mul_mat_q(*cuda_ctx, src0, src1, ids, glu, /*convrot =*/ false, &fusion_data);
                 fused_mul_mat_vec = true;
                 fused_node_count  = 3;
                 break;

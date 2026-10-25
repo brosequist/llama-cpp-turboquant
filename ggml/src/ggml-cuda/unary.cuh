@@ -112,3 +112,18 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_oai_single(float x, float g
     out_glu = out_glu * (1.0f + g);
     return out_glu;
 }
+
+// Shared by the fused gate/up MMQ write-back (#28702 port). This fork has no SWIGLU_CLAMP; glu_limit is unused.
+__device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
+    GGML_UNUSED(limit);
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            return up * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:
+            return up * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_cuda_op_swiglu_oai_single(gate, up);
+        default:
+            return up * gate;
+    }
+}
