@@ -14,27 +14,29 @@ process**, serving through llama-swap in a k3s cluster.
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `deploy/rocm101-stack`, deployed 2026-10-25, measured back-to-back with the
-previous build under the same GPU conditions (see the note on navi48 clocks below).
+this work, without MTP. **After** is `deploy/rocm101-stack` plus the navi48 clock watcher, deployed 2026-10-25,
+measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| Decode, code prompt (t/s) | ~21 (no speculation) | **46.6** | **~2.2×** |
-| Decode, prose prompt (t/s) | ~21 | **37.1** | ~1.8× |
-| Decode, 9.3K-token summarisation (t/s) | ~21 | **35.0** | ~1.7× |
+| Decode, code prompt (t/s) | ~21 (no speculation) | **51.5** | **~2.5×** |
+| Decode, prose prompt (t/s) | ~21 | **41.0** | ~2.0× |
+| Decode, 9.3K-token summarisation (t/s) | ~21 | **39.1** | ~1.9× |
 | Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **~1520** | ~1.9× |
-| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **1310–1320** | ~1.75× |
+| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **1394** | ~1.85× |
 | Prefill @ 64K context depth (t/s) | 223 | 492 | 2.2× |
 | Prefill @ 224K context depth (t/s) | 152 | 383 | 2.5× |
 | KL divergence vs f16 KV (turbo4) | 0.0080 | 0.0065 | lower is better |
 | VRAM, navi44 / navi48 (GB) | 14.3 / 10.8 (unbalanced) | 13.5 / 12.9 | balanced; ~2.5 GB headroom each |
 
-North-Mini-Code: decode at long context with the q8_0 KV cache, `llama-bench tg64`.
+North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench tg64`; edit/fresh rows: llama-server, temp 0).
 
-| Context depth | Before (t/s) | After (t/s) | Change |
+| Workload | Before (t/s) | After (t/s) | Change |
 |---|---:|---:|---:|
-| 32K | 31.9 | 46.5 | +46% |
-| 64K | 23.8 | 43.3 | +82% |
+| Decode @ 32K context | 31.9 | 46.5 | +46% |
+| Decode @ 64K context | 23.8 | 43.3 | +82% |
+| Rewrite a 200-line file with a small change | 57.1 | 139.9 (157.6 live) | **~2.5×** |
+| Write new code from scratch | 58.4 | 58.0 | unchanged |
 
 Before is the previous production build (`rocm-db6212f`, ROCm 7.2.1), after is the deployed build, back to back. Most of
 the gain is [#30803](https://github.com/ggml-org/llama.cpp/pull/30803): on ROCm 10.1 alone it measured 41.5 → 52.6 @32K,
@@ -88,6 +90,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | ggml-org **[#31037](https://github.com/ggml-org/llama.cpp/pull/31037)** port: trimmed MTP draft head (`LLAMA_MTP_DRAFT_VOCAB=65536`). The draft only proposes ids below 65536 and the target still verifies, so output is unaffected | summary / code / prose | 32.63 / 41.01 / 34.63 | 34.72 / 45.56 / 37.13 |
 | **ROCm 7.2.1 → 10.1.0** + batch 1, same conditions | summary / code / prose | 33.1 / 48.1 / 35.1 | 35.0 / 46.6 / 37.1 |
 | **[#30803](https://github.com/ggml-org/llama.cpp/pull/30803) port**: RDNA4 block-per-lane q8_0/q4_0 K plus GQA head batching in the vec FA kernel. North only; see the table above | North @64K | 23.8 | 43.3 |
+| **navi48 DPM `high` only while serving** (host service, not fork code). The split leaves navi48 idle between bursts and its DPM drops to ~1.6 GHz; a watcher polls both GPUs' busy % every 250 ms, sets `high` on load and `auto` 30 s after. Idle power stays ~15 W instead of 38 W | summary / code / prose; 9.3K prefill | 35.2 / 46.6 / 37.1; 1350 | 39.1 / 51.5 / 41.0; 1394 |
+| **`--spec-type ngram-simple` on North-Mini-Code**: draft-free n-gram speculation. North has no MTP head and the only EAGLE3 draft doesn't load in this fork | North: code edit / fresh code | 57.1 / 58.4 | 139.9 / 58.0 |
 
 ### Mainline cherry-picks (batch 1: correctness and security)
 
@@ -110,7 +114,9 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | Quantised draft KV (`-ctkd/-ctvd q8_0`) | No speedup; +0.5 GB (the draft KV already inherits turbo4) |
 | Separate, larger n_ubatch for the MTP draft context | No gain, because the MTP head decode is compute-bound; +0.7–1.9 GB |
 | Disabling HIP graphs | About −1% |
-| `power_dpm_force_performance_level=high` on navi48 | +11% MTP decode, but 38 W idle instead of 8 W around the clock. Not adopted |
+| `power_dpm_force_performance_level=high` on navi48 permanently | +11% MTP decode, but 38 W idle instead of 8 W around the clock. Replaced by the busy-triggered watcher above |
+| Other n-gram modes on North (code edit / fresh) | ngram-mod 109 / 58, ngram-map-k4v 91 / 58, ngram-map-k 80 / 58, ngram-cache 90 / 52 (slower on fresh) vs ngram-simple 140 / 58 |
+| EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
 
 ## Branches
 
