@@ -1104,9 +1104,9 @@ void ggml_cuda_flash_attn_ext_vec_case_d512(ggml_backend_cuda_context & ctx, ggm
     float logit_softcap;
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
     if (logit_softcap == 0.0f) {
-        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, type_K, type_V, false>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, 1, type_K, type_V, false>(ctx, dst);
     } else {
-        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, type_K, type_V, true>(ctx, dst);
+        ggml_cuda_flash_attn_ext_vec_case_impl<512, 1, 1, type_K, type_V, true>(ctx, dst);
     }
 }
 
