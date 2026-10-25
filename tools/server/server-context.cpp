@@ -4135,7 +4135,13 @@ private:
             }
         }
 
+        static const bool mtp_prof = getenv("LLAMA_MTP_PROF") != nullptr;
+        const int64_t t_prof0 = mtp_prof ? ggml_time_us() : 0;
         const int ret = llama_decode(ctx_tgt, batch_view);
+        if (mtp_prof) {
+            llama_synchronize(ctx_tgt);
+        }
+        const int64_t t_prof1 = mtp_prof ? ggml_time_us() : 0;
 
         metrics.on_decoded(slots);
 
@@ -4192,7 +4198,16 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
+        const bool spec_ok = common_speculative_process(spec.get(), batch_view);
+        if (mtp_prof) {
+            if (ctx_dft) {
+                llama_synchronize(ctx_dft);
+            }
+            const int64_t t_prof2 = ggml_time_us();
+            SRV_INF("mtp-prof n_tokens=%d decode_ms=%.2f process_ms=%.2f\n", batch_view.n_tokens,
+                    (t_prof1 - t_prof0) / 1e3, (t_prof2 - t_prof1) / 1e3);
+        }
+        if (!spec_ok) {
             SRV_ERR("%s", "failed to process speculative batch\n");
 
             // TODO: handle error
