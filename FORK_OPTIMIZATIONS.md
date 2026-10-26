@@ -37,6 +37,10 @@ North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench t
 | Decode @ 64K context | 23.8 | 43.3 | +82% |
 | Rewrite a 200-line file with a small change | 57.1 | 139.9 (157.6 live) | **~2.5×** |
 | Write new code from scratch | 58.4 | 58.0 | unchanged |
+| Write new code from scratch, single-token MoE routing (release candidate `exp/moe-n1`) | 58.2 | **73.3** | **+26%** |
+| Rewrite a file, first 1200 tokens, single-token MoE routing (release candidate) | 163.7 | **180.8** | +10% |
+
+The last two rows are a separate same-session A/B (1200-token completions, `--spec-type ngram-simple`); see the Decode table.
 
 Before is the previous production build (`rocm-db6212f`, ROCm 7.2.1), after is the deployed build, back to back. Most of
 the gain is [#30803](https://github.com/ggml-org/llama.cpp/pull/30803): on ROCm 10.1 alone it measured 41.5 → 52.6 @32K,
@@ -92,6 +96,7 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **[#30803](https://github.com/ggml-org/llama.cpp/pull/30803) port**: RDNA4 block-per-lane q8_0/q4_0 K plus GQA head batching in the vec FA kernel. North only; see the table above | North @64K | 23.8 | 43.3 |
 | **navi48 DPM `high` only while serving** (host service, not fork code). The split leaves navi48 idle between bursts and its DPM drops to ~1.6 GHz; a watcher polls both GPUs' busy % every 250 ms, sets `high` on load and `auto` 30 s after. Idle power stays ~15 W instead of 38 W | summary / code / prose; 9.3K prefill | 35.2 / 46.6 / 37.1; 1350 | 39.1 / 51.5 / 41.0; 1394 |
 | **`--spec-type ngram-simple` on North-Mini-Code**: draft-free n-gram speculation. North has no MTP head and the only EAGLE3 draft doesn't load in this fork | North: code edit / fresh code | 57.1 / 58.4 | 139.9 / 58.0 |
+| **Single-token MUL_MAT_ID through the MoE MMVQ kernel on RDNA4** (ours, release candidate `exp/moe-n1`). A rocprofv3 profile of North's fresh-code decode showed the expert matmuls taking ~45% of GPU time at ~100 GB/s: the generic `mul_mat_vec_q` runs 8 warps per output row on RDNA4, so North's short expert rows (Q5_K down K = 768, Q4_K gate/up K = 2048) leave most lanes idle. One-token calls now use the fork's dedicated `mul_mat_vec_q_moe` kernel (one warp per 2 rows per expert slot), which already served 2–8 tokens, including its fused SwiGLU gate/up form. Microbenchmark on navi48: Q5_K down 146 → 86 µs, Q4_K gate/up 86 → 65 µs (navi44 flat). `GGML_CUDA_MMVQ_MOE_N1=0` restores the old routing. Only MoE models are affected; Qwen3.8 is dense | North: code edit (first 1200 tokens) / fresh code | 163.7 / 58.2 | 180.8 / 73.3 |
 
 ### Mainline cherry-picks (batch 1: correctness and security)
 
@@ -116,6 +121,12 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | Disabling HIP graphs | About −1% |
 | `power_dpm_force_performance_level=high` on navi48 permanently | +11% MTP decode, but 38 W idle instead of 8 W around the clock. Replaced by the busy-triggered watcher above |
 | Other n-gram modes on North (code edit / fresh) | ngram-mod 109 / 58, ngram-map-k4v 91 / 58, ngram-map-k 80 / 58, ngram-cache 90 / 52 (slower on fresh) vs ngram-simple 140 / 58 |
+| ggml-org **[#30804](https://github.com/ggml-org/llama.cpp/pull/30804)** + **[#31053](https://github.com/ggml-org/llama.cpp/pull/31053)** (chunked CUDA graphs), batch 2a | No change at any chunk size (0 / 256 / 512 / 1024): 9.3K prefill 1366–1367 vs 1371, decode within 0.4%. Graph launch overhead is not a bottleneck here. Branch `exp/cp-batch2a` |
+| ggml-org **[#29353](https://github.com/ggml-org/llama.cpp/pull/29353)** (chunked tensor-core GDN), batch 2b | Ported with RDNA4 WMMA tiles; correct (GDN 52/52, PPL 6.7491 → 6.7452) but not faster at Qwen3.8's shape (16 K / 48 V heads): navi48 5% slower at 256 tokens and 23–31% slower at 1–4K; navi44 7% faster at 256. GDN is ~10% of prefill. Mainline enables it only on RDNA3.5 at ≥ 2048 tokens. Branch `exp/cp-batch2b` |
+| ggml-org **[#30087](https://github.com/ggml-org/llama.cpp/pull/30087)** (4 GDN columns per warp), batch 2b | Not needed: it changes the legacy column kernel, and this fork defaults to the row-per-warp port, which already processes 4 columns per warp |
+| ggml-org **[#25952](https://github.com/ggml-org/llama.cpp/pull/25952)** (fused MoE weighted expert reduction), batch 3 | North fresh decode 58.2 → 58.6 (+0.6%, noise). Changes summation order, so outputs diverge. Branch `exp/cp-batch3` |
+| Batch 3 PRs that don't apply to North | [#29184](https://github.com/ggml-org/llama.cpp/pull/29184) (shared experts) and [#29181](https://github.com/ggml-org/llama.cpp/pull/29181) (grouped top-k): North has neither. [#27978](https://github.com/ggml-org/llama.cpp/pull/27978): only adds n_expert_used = 10; North's 8 already has the fast path. [#30517](https://github.com/ggml-org/llama.cpp/pull/30517): low-bit MMVQ, needs earlier mainline MMVQ refactors and only touches Q6_K among North's types. [#27621](https://github.com/ggml-org/llama.cpp/pull/27621) (multi-token MoE fusion) is deferred: mainline refactored the MoE MMVQ kernel first, and multi-token batches already use the faster kernel |
+| RDNA4 small-K MMVQ (rows per block = warps per block for short rows) | Q4_K gate/up 129 → 87 µs on navi48 alone, but no end-to-end gain on top of the single-token MoE routing (73.3 vs 73.3 t/s) |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
 
 ## Branches
@@ -124,3 +135,5 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 [#30803](https://github.com/ggml-org/llama.cpp/pull/30803) (`exp/fattn-vec-rdna4-30803`). Earlier steps are on `exp/turbo-innerq-per-device`, `exp/mmvf-single-launch`,
 `deploy/qwen38-mtp-tune`, `fix/mmq-oob-29953`, `fix/multigpu-mixed-arch-mmf-gemm` and
 `fix/cohere2moe-mixedarch-router-mmvf`.
+
+`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing (release candidate). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
