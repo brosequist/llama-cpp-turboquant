@@ -5266,6 +5266,55 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // CPY run -> one launch. Qwen3.5/3.8 GDN layers write K = n_rs_seq + 1 conv-state rollback windows
+    // per ubatch (K consecutive f32 CPYs between views of the same two tensors); with MTP that is 4 tiny
+    // copies per layer, each paying a full launch. GGML_CUDA_BATCHED_CPY=0 disables it.
+    if (node->op == GGML_OP_CPY) {
+        static const bool batched_cpy_off = getenv("GGML_CUDA_BATCHED_CPY") != nullptr &&
+                                            std::atoi(getenv("GGML_CUDA_BATCHED_CPY")) == 0;
+        const ggml_tensor * s0 = node->src[0];
+        const ggml_tensor * d0 = node->src[1];
+        if (!batched_cpy_off && s0->type == GGML_TYPE_F32 && d0->type == GGML_TYPE_F32) {
+            const ggml_tensor * run[GGML_CUDA_CPY_BATCH_MAX] = { node };
+            int n_run = 1;
+            int last  = i;
+            auto same_layout = [](const ggml_tensor * a, const ggml_tensor * b) {
+                return a->type == b->type && ggml_are_same_shape(a, b) && ggml_are_same_stride(a, b);
+            };
+            auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+                const char * a0 = (const char *) a->data; const char * a1 = a0 + ggml_nbytes(a);
+                const char * b0 = (const char *) b->data; const char * b1 = b0 + ggml_nbytes(b);
+                return a0 < b1 && b0 < a1;
+            };
+            for (int j = i + 1; j < cgraph->n_nodes && n_run < GGML_CUDA_CPY_BATCH_MAX; ++j) {
+                const ggml_tensor * n = cgraph->nodes[j];
+                if (ggml_cuda_is_view_or_noop(n)) {
+                    continue;
+                }
+                if (n->op != GGML_OP_CPY || !same_layout(n->src[0], s0) || !same_layout(n->src[1], d0)) {
+                    break;
+                }
+                // every copy reads before any writes, so no destination may touch another copy's
+                // source or destination
+                bool clash = false;
+                for (int k = 0; k < n_run && !clash; ++k) {
+                    clash = overlaps(n->src[1], run[k]->src[0]) || overlaps(n->src[1], run[k]->src[1]) ||
+                            overlaps(run[k]->src[1], n->src[0]);
+                }
+                if (clash) {
+                    break;
+                }
+                run[n_run++] = n;
+                last = j;
+            }
+            if (n_run >= 2) {
+                ggml_cuda_cpy_f32_batched(*cuda_ctx, run, n_run);
+                cuda_ctx->fusion_stats.batched_cpy++;
+                return last - i;
+            }
+        }
+    }
+
     // gated_delta_net -> cpy: scatter recurrent-state snapshots into the cache
     if (node->op == GGML_OP_GATED_DELTA_NET) {
         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
@@ -7577,6 +7626,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "moe_weighted_reduction") == 0) {
         return ctx->fusion_stats.moe_weighted_reduction;
+    }
+    if (strcmp(name, "batched_cpy") == 0) {
+        return ctx->fusion_stats.batched_cpy;
     }
     return -1;
 }
