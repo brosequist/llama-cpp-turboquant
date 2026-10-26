@@ -156,6 +156,11 @@ TheTom's own knobs (`GGML_CUDA_Q8CACHE`, `GGML_CUDA_FUSE_CHAIN`, `TURBO_*`, …)
 
 ## Branches
 
+**`bump/thetom-1021-mainline` (the default branch) is the production code**: after each deploy, the deployed branch is
+merged into it (first done 2026-10-26 for `exp/qwen-q5k` / `app-7f2bd32`). Before that it carried only these docs on
+top of the 2026-10-24 code.
+
+
 `deploy/rocm101-stack` = `exp/gdn-rows-per-warp` → `exp/mtp-no-batch-sync` → `exp/rocm-10.1` → `exp/cp-batch1` →
 [#30803](https://github.com/ggml-org/llama.cpp/pull/30803) (`exp/fattn-vec-rdna4-30803`). Earlier steps are on `exp/turbo-innerq-per-device`, `exp/mmvf-single-launch`,
 `deploy/qwen38-mtp-tune`, `fix/mmq-oob-29953`, `fix/multigpu-mixed-arch-mmf-gemm` and

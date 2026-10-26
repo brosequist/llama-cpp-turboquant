@@ -6,8 +6,8 @@
 > (MoE): fresh-code decode 58 → 81 t/s, decode at 64K context 23.8 → 43.3 t/s, code edits 57 → 140+ t/s. Each change,
 > with before/after numbers and rejected experiments: **[FORK_OPTIMIZATIONS.md](FORK_OPTIMIZATIONS.md)**.
 >
-> **The deployed code is on branch [`exp/qwen-q5k`](https://github.com/brosequist/llama-cpp-turboquant/tree/exp/qwen-q5k)**;
-> this default branch carries the documentation on top of an older code base (see "Branches" in FORK_OPTIMIZATIONS.md).
+> **This default branch is the code in production** (currently `exp/qwen-q5k`, deployed as `app-7f2bd32`); it is updated
+> after every deploy. Experiment branches are listed under "Branches" in FORK_OPTIMIZATIONS.md.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
