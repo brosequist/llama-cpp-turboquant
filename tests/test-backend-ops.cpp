@@ -6890,6 +6890,53 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// K CPYs of sliding windows of one tensor into K slots of another, as Qwen3.5/3.8 GDN layers write their
+// conv-state rollback windows (delta-net-base.cpp). The CUDA backend runs the run as one launch.
+struct test_cpy_batched : public test_case {
+    const int64_t C;      // channels
+    const int64_t T;      // new tokens
+    const int64_t K;      // windows / slots
+
+    test_cpy_batched(int64_t C, int64_t T, int64_t K) : C(C), T(T), K(K) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(C, T, K);
+    }
+
+    const char * required_fusion() override { return K >= 2 ? "batched_cpy" : nullptr; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BATCHED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t w = 3; // conv window (kernel size - 1)
+        ggml_tensor * in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w + T, C, 1);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w*C, K);
+        ggml_set_name(in, "in");
+        ggml_set_name(cache, "cache");
+
+        std::vector<ggml_tensor *> outs;
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, T - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * src = ggml_view_3d(ctx, in, w, C, 1, in->nb[1], in->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
+            ggml_tensor * dst = ggml_view_2d(ctx, cache, w*C, 1, cache->nb[1], s_slot*cache->nb[1]);
+            outs.push_back(ggml_cpy(ctx, src, dst));
+        }
+        // right-nested sum, so the graph visits the CPYs back to back before any consumer
+        ggml_tensor * out = outs.back();
+        for (int64_t k = (int64_t) outs.size() - 2; k >= 0; --k) {
+            out = ggml_add(ctx, outs[k], out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // CONCAT along dim 0 of a narrow window and a transposed activation: the Qwen3.5/3.8 GDN conv input
 // [3 + n_tokens, channels]. Exercises the narrow non-contiguous dim-0 concat path.
 struct test_concat_transposed : public test_case {
@@ -9126,6 +9173,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 4, 1, 1}));
+    for (int64_t K : {1, 2, 4}) {
+        test_cases.emplace_back(new test_cpy_batched(64, 4, K));
+        test_cases.emplace_back(new test_cpy_batched(10240, 1, K));
+    }
     for (int64_t T : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_concat_transposed(10240, T));
         test_cases.emplace_back(new test_concat_transposed(33, T));
