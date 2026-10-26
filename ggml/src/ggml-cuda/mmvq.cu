@@ -1309,6 +1309,9 @@ void ggml_cuda_mul_mat_vec_q(
     // Shared-quantize cache: reuse the previous quantization when the same src1 tensor is
     // consumed again in this graph eval with the same layout (see q8_cache in common.cuh).
     // ConvRot types and MUL_MAT_ID stay uncached; oversized batches fall back too.
+    // Not keyed on src0->type: the q8_1 layout does not depend on it (quantize_row_q8_1_cuda
+    // ignores type_src0), so matvecs of different weight types on one input share it too, e.g.
+    // Qwen3.5/3.8 attn_qkv (Q5_K) + attn_gate (IQ4_XS), and Q/K (IQ4_XS) + V (Q5_K).
     auto & qc = ctx.q8_cache;
     static const bool q8_cache_disabled = getenv("GGML_CUDA_Q8CACHE") != nullptr && atoi(getenv("GGML_CUDA_Q8CACHE")) == 0;
     // Main stream only: a sibling stream could consume the buffer with no cross-stream ordering.
@@ -1316,8 +1319,7 @@ void ggml_cuda_mul_mat_vec_q(
                               ctx.curr_stream_no == 0;
     const bool q8_hit = q8_cacheable && qc.epoch == ctx.graph_epoch && qc.src1 == src1 &&
                         qc.data == src1->data && qc.size == q8_bytes &&
-                        qc.ne10_padded == ne10_padded && qc.type == src0->type &&
-                        qc.dev == ctx.device;
+                        qc.ne10_padded == ne10_padded && qc.dev == ctx.device;
 
     ggml_cuda_pool_alloc<char> src1_q8_1_local(ctx.pool());
     char * src1_q8_1 = nullptr;
@@ -1347,7 +1349,6 @@ void ggml_cuda_mul_mat_vec_q(
             qc.epoch       = ctx.graph_epoch;
             qc.size        = q8_bytes;
             qc.ne10_padded = ne10_padded;
-            qc.type        = src0->type;
         } else {
             src1_q8_1 = src1_q8_1_local.alloc(q8_bytes);
         }
