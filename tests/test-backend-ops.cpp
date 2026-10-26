@@ -6890,6 +6890,34 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// CONCAT along dim 0 of a narrow window and a transposed activation: the Qwen3.5/3.8 GDN conv input
+// [3 + n_tokens, channels]. Exercises the narrow non-contiguous dim-0 concat path.
+struct test_concat_transposed : public test_case {
+    const int64_t C;
+    const int64_t T;
+
+    test_concat_transposed(int64_t C, int64_t T) : C(C), T(T) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(C, T);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_TRANSPOSED";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, 1);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+        ggml_set_name(a, "a");
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, x), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // ADD(x, row) -> SOFTPLUS -> MUL(row): the GDN dt/A gate of Qwen3.5/3.8 over a multi-token batch, where
 // the per-head bias and A are single rows broadcast over the tokens.
 struct test_elem_chain_row_bcast : public test_case {
@@ -9098,6 +9126,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 4, 1, 1}));
+    for (int64_t T : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_concat_transposed(10240, T));
+        test_cases.emplace_back(new test_concat_transposed(33, T));
+    }
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 1, 1, 1}));
     test_cases.emplace_back(new test_elem_chain_row_bcast({63, 5, 1, 1}));
     test_cases.emplace_back(new test_elem_chain_row_bcast({128, 3, 2, 1}));
