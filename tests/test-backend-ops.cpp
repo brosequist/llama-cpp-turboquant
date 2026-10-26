@@ -7094,7 +7094,12 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     // Each case builds exactly one epilogue; require the counter for the one it built.
+    // Dense multi-token gate fusion is RDNA4-only (ggml_cuda_should_fuse_mul_mat_vec_q), so those
+    // cases check numerics only.
     const char * required_fusion() override {
+        if (!use_id && m > 1) {
+            return nullptr;
+        }
         return with_gate ? "mul_mat_glu" : (with_bias ? "mul_mat_bias" : nullptr);
     }
 
@@ -11038,6 +11043,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // dense gate/up + GLU over 2-5 tokens (MTP/speculative verify batches); 5 exercises the unfused fallback
+    for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+        for (int64_t m : {2, 3, 4, 5}) {
+            for (ggml_glu_op glu_op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, glu_op, m, 64, 512,
+                    false, 1, 1, false, false, true, false, {1, 1}));
             }
         }
     }
