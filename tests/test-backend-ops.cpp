@@ -6890,6 +6890,42 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// Residual ADD -> RMS_NORM -> MUL(weight), with the sum read again afterwards (the residual stream).
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne, float eps = 1e-6f) : ne(ne), eps(eps) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    const char * required_fusion() override { return "add_rms_norm"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * s   = ggml_add(ctx, a, b);
+        ggml_tensor * n   = ggml_mul(ctx, ggml_rms_norm(ctx, s, eps), w);
+        ggml_tensor * out = ggml_add(ctx, n, s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // K CPYs of sliding windows of one tensor into K slots of another, as Qwen3.5/3.8 GDN layers write their
 // conv-state rollback windows (delta-net-base.cpp). The CUDA backend runs the run as one launch.
 struct test_cpy_batched : public test_case {
@@ -9173,6 +9209,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 4, 1, 1}));
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {5120, 1, 1, 1}, {5120, 4, 1, 1}, {4096, 3, 2, 1}, {256, 5, 1, 1}, {64, 1, 1, 1} }) {
+        test_cases.emplace_back(new test_add_rms_norm_mul(ne));
+    }
     for (int64_t K : {1, 2, 4}) {
         test_cases.emplace_back(new test_cpy_batched(64, 4, K));
         test_cases.emplace_back(new test_cpy_batched(10240, 1, K));

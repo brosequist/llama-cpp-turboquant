@@ -5406,6 +5406,42 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // Residual ADD -> RMS_NORM -> MUL(weight): the add's output stays materialized (later layers read the
+    // residual), the norm intermediate is never written. Two of these per transformer layer.
+    // GGML_CUDA_ADD_RMS_NORM=0 disables it.
+    if (node->op == GGML_OP_ADD && i + 2 < cgraph->n_nodes) {
+        static const bool add_rms_norm_off = getenv("GGML_CUDA_ADD_RMS_NORM") != nullptr &&
+                                             std::atoi(getenv("GGML_CUDA_ADD_RMS_NORM")) == 0;
+        ggml_tensor * norm = cgraph->nodes[i + 1];
+        ggml_tensor * mul  = cgraph->nodes[i + 2];
+        const ggml_tensor * a = node->src[0];
+        const ggml_tensor * b = node->src[1];
+        const ggml_tensor * w = mul->op == GGML_OP_MUL ? (mul->src[0] == norm ? mul->src[1] : mul->src[0]) : nullptr;
+        auto f32c = [](const ggml_tensor * t) { return t && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t); };
+        if (!add_rms_norm_off && norm->op == GGML_OP_RMS_NORM && norm->src[0] == node &&
+                mul->op == GGML_OP_MUL && (mul->src[0] == norm || mul->src[1] == norm) &&
+                f32c(node) && f32c(a) && f32c(b) && f32c(norm) && f32c(mul) && f32c(w) &&
+                ggml_are_same_shape(a, node) && ggml_are_same_shape(b, node) && ggml_are_same_shape(mul, node) &&
+                w->ne[0] == node->ne[0] && ggml_nrows(w) == 1) {
+            const ggml_op ops[3] = { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL };
+            const int     outs[2] = { i, i + 2 };
+            // partial overlaps are unsafe; exact aliasing of a row onto itself is fine (see the kernel)
+            auto bad = [](const ggml_tensor * x, const ggml_tensor * y) {
+                const char * x0 = (const char *) x->data; const char * x1 = x0 + ggml_nbytes(x);
+                const char * y0 = (const char *) y->data; const char * y1 = y0 + ggml_nbytes(y);
+                return x0 < y1 && y0 < x1 && !(x0 == y0 && x1 == y1);
+            };
+            const bool aliasing_ok = !bad(node, a) && !bad(node, b) && !bad(mul, a) && !bad(mul, b) &&
+                                     mul->data != node->data && !bad(mul, node) &&
+                                     !bad(mul, w) && mul->data != w->data && !bad(node, w) && node->data != w->data;
+            if (aliasing_ok && ggml_can_fuse_subgraph(cgraph, i, 3, ops, outs, 2)) {
+                ggml_cuda_op_add_rms_norm_mul(*cuda_ctx, node, norm, mul);
+                cuda_ctx->fusion_stats.add_rms_norm++;
+                return 2;
+            }
+        }
+    }
+
     // Elementwise chain ("midi-kernel"), see ggml_cuda_fuse_elem_chain(). It runs before the
     // tuned fusions below (multi-ADD/MUL, unary+MUL, RELU+SQR) and covers a superset of their
     // patterns; a pure same-layout ADD or MUL run is the one case it hands back to them, since
@@ -7629,6 +7665,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "batched_cpy") == 0) {
         return ctx->fusion_stats.batched_cpy;
+    }
+    if (strcmp(name, "add_rms_norm") == 0) {
+        return ctx->fusion_stats.add_rms_norm;
     }
     return -1;
 }
