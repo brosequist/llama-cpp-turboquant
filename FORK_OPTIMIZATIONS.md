@@ -9,12 +9,12 @@ process**, serving through llama-swap in a k3s cluster.
 | GPUs | RX 9070 XT (navi48, gfx1201, 16 GB), plus RX 9060 XT (navi44, gfx1200, 16 GB, half the memory bandwidth) |
 | Host | Ryzen 9 7900X, Ubuntu with the in-tree amdgpu driver (kernel 7.0) |
 | Main model | Qwen3.8-27B IQ4_XS (`qwen35` arch: hybrid GDN + attention, MTP head). 262K context, turbo4 KV, layer split across both GPUs (`--tensor-split 1.3,1`) |
-| Second dual-GPU model | North-Mini-Code-1.0 UD-Q4_K_XL (`cohere2moe`). 262K context, q8_0 KV, `--tensor-split 1,1` |
+| Second dual-GPU model | North-Mini-Code-1.0 UD-Q4_K_XL (`cohere2moe`). 262K context, q8_0 KV, `--device ROCm1,ROCm0 --tensor-split 1,1` |
 
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `exp/moe-n1` (`deploy/rocm101-stack` + single-token MoE routing) plus the navi48 clock watcher and `--tensor-split 1.3,1`, deployed 2026-10-26,
+this work, without MTP. **After** is `exp/moe-sum` (`deploy/rocm101-stack` + single-token MoE routing + fused decode MoE sum) plus the navi48 clock watcher and `--tensor-split 1.3,1`, deployed 2026-10-26,
 measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
@@ -38,6 +38,7 @@ North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench t
 | Rewrite a 200-line file with a small change | 57.1 | 139.9 (157.6 live) | **~2.5×** |
 | Write new code from scratch | 58.4 | 58.0 | unchanged |
 | Write new code from scratch, single-token MoE routing (deployed 2026-10-26) | 58.2 | **73.3** | **+26%** |
+| Write new code from scratch, + fused MoE sum and `--device ROCm1,ROCm0` (deployed 2026-10-26) | 58.2 | **80.9** | **+39%** |
 | Rewrite a file, first 1200 tokens, single-token MoE routing (deployed) | 163.7 | **180.8** | +10% |
 
 The last two rows are a separate same-session A/B (1200-token completions, `--spec-type ngram-simple`); see the Decode table.
@@ -97,6 +98,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **navi48 DPM `high` only while serving** (host service, not fork code). The split leaves navi48 idle between bursts and its DPM drops to ~1.6 GHz; a watcher polls both GPUs' busy % every 250 ms, sets `high` on load and `auto` 30 s after. Idle power stays ~15 W instead of 38 W | summary / code / prose; 9.3K prefill | 35.2 / 46.6 / 37.1; 1350 | 39.1 / 51.5 / 41.0; 1394 |
 | **`--spec-type ngram-simple` on North-Mini-Code**: draft-free n-gram speculation. North has no MTP head and the only EAGLE3 draft doesn't load in this fork | North: code edit / fresh code | 57.1 / 58.4 | 139.9 / 58.0 |
 | **Single-token MUL_MAT_ID through the MoE MMVQ kernel on RDNA4** (ours, `exp/moe-n1`, deployed 2026-10-26). A rocprofv3 profile of North's fresh-code decode showed the expert matmuls taking ~45% of GPU time at ~100 GB/s: the generic `mul_mat_vec_q` runs 8 warps per output row on RDNA4, so North's short expert rows (Q5_K down K = 768, Q4_K gate/up K = 2048) leave most lanes idle. One-token calls now use the fork's dedicated `mul_mat_vec_q_moe` kernel (one warp per 2 rows per expert slot), which already served 2–8 tokens, including its fused SwiGLU gate/up form. Microbenchmark on navi48: Q5_K down 146 → 86 µs, Q4_K gate/up 86 → 65 µs (navi44 flat). `GGML_CUDA_MMVQ_MOE_N1=0` restores the old routing. Only MoE models are affected; Qwen3.8 is dense | North: code edit (first 1200 tokens) / fresh code | 163.7 / 58.2 | 180.8 / 73.3 |
+| **Fused decode MoE expert sum** (ours on top of [#25952](https://github.com/ggml-org/llama.cpp/pull/25952), `exp/moe-sum`, deployed 2026-10-26). For one token the graph sums the weighted expert outputs as mul → cont(permute) → sum_rows, and on navi44 sum_rows alone cost 10–12 µs per layer. A new matcher recognises that 4-node form and runs it through #25952's weighted-reduction kernel. `GGML_CUDA_MOE_WEIGHTED_REDUCTION=0` disables both forms. Summation order changes, so output text can differ slightly | North `llama-bench tg128`, empty / 16K context | 74.7 / 68.5 | 79.4 / 71.6 |
+| **`--device ROCm1,ROCm0` for North** (launch flag). North ties its output layer to the token embedding (570 MB), and llama.cpp puts it on the last device. With the default order that is navi44, where it costs 1.8 ms per token. Reversing the order moves it to navi48; the split ratio follows the device list. VRAM peak 13.9 GB navi44 / 14.4 GB navi48. Rejected for Qwen3.8: it either fills navi48 or costs 17% prefill | North `llama-bench tg128`, empty / 16K context; llama-server fresh code | 79.4 / 71.6; 73.3 | 83.3 / 74.0; **80.9** |
 | **`--tensor-split 1.3,1`** for Qwen3.8 (was 1.2,1), re-tuned after the GDN kernel, `-b 8192`, the clock watcher and the new build. 1.1 / 1.4: 1334 / 1482 prefill, but 1.4 lost short-prompt prefill (254 → 188); `-ub` 384 / 512 were slower than 256. North stays at `1,1`: 1.4,1 gains ~3% on fresh code but leaves navi48 ~0.4 GB free, and navi48 also drives the desktop | summary / code / prose; 9.3K prefill | 38.9 / 51.5 / 41.0; 1371 | 39.3 / 52.1 / 41.5; 1451 |
 
 ### Mainline cherry-picks (batch 1: correctness and security)
@@ -125,7 +128,7 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | ggml-org **[#30804](https://github.com/ggml-org/llama.cpp/pull/30804)** + **[#31053](https://github.com/ggml-org/llama.cpp/pull/31053)** (chunked CUDA graphs), batch 2a | No change at any chunk size (0 / 256 / 512 / 1024): 9.3K prefill 1366–1367 vs 1371, decode within 0.4%. Graph launch overhead is not a bottleneck here. Branch `exp/cp-batch2a` |
 | ggml-org **[#29353](https://github.com/ggml-org/llama.cpp/pull/29353)** (chunked tensor-core GDN), batch 2b | Ported with RDNA4 WMMA tiles; correct (GDN 52/52, PPL 6.7491 → 6.7452) but not faster at Qwen3.8's shape (16 K / 48 V heads): navi48 5% slower at 256 tokens and 23–31% slower at 1–4K; navi44 7% faster at 256. GDN is ~10% of prefill. Mainline enables it only on RDNA3.5 at ≥ 2048 tokens. Branch `exp/cp-batch2b` |
 | ggml-org **[#30087](https://github.com/ggml-org/llama.cpp/pull/30087)** (4 GDN columns per warp), batch 2b | Not needed: it changes the legacy column kernel, and this fork defaults to the row-per-warp port, which already processes 4 columns per warp |
-| ggml-org **[#25952](https://github.com/ggml-org/llama.cpp/pull/25952)** (fused MoE weighted expert reduction), batch 3 | North fresh decode 58.2 → 58.6 (+0.6%, noise). Changes summation order, so outputs diverge. Branch `exp/cp-batch3` |
+| ggml-org **[#25952](https://github.com/ggml-org/llama.cpp/pull/25952)** (fused MoE weighted expert reduction), batch 3 | North fresh decode 58.2 → 58.6 (+0.6%, noise): on its own it only matches the multi-token form. Changes summation order, so outputs diverge. Its kernel is reused by the deployed fused decode MoE sum above. Branch `exp/cp-batch3` |
 | Batch 3 PRs that don't apply to North | [#29184](https://github.com/ggml-org/llama.cpp/pull/29184) (shared experts) and [#29181](https://github.com/ggml-org/llama.cpp/pull/29181) (grouped top-k): North has neither. [#27978](https://github.com/ggml-org/llama.cpp/pull/27978): only adds n_expert_used = 10; North's 8 already has the fast path. [#30517](https://github.com/ggml-org/llama.cpp/pull/30517): low-bit MMVQ, needs earlier mainline MMVQ refactors and only touches Q6_K among North's types. [#27621](https://github.com/ggml-org/llama.cpp/pull/27621) (multi-token MoE fusion) is deferred: mainline refactored the MoE MMVQ kernel first, and multi-token batches already use the faster kernel |
 | RDNA4 small-K MMVQ (rows per block = warps per block for short rows) | Q4_K gate/up 129 → 87 µs on navi48 alone, but no end-to-end gain on top of the single-token MoE routing (73.3 vs 73.3 t/s) |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
@@ -137,4 +140,4 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 `deploy/qwen38-mtp-tune`, `fix/mmq-oob-29953`, `fix/multigpu-mixed-arch-mmf-gemm` and
 `fix/cohere2moe-mixedarch-router-mmvf`.
 
-`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing (deployed 2026-10-26). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
+`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing. `exp/moe-sum` = `exp/moe-n1` + #25952 + the decode-form matcher (deployed 2026-10-26). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
