@@ -22,7 +22,7 @@ measured back to back under the same GPU conditions (see the note on navi48 cloc
 | Decode, code prompt (t/s) | ~21 (no speculation) | **54.8** | **~2.6×** |
 | Decode, prose prompt (t/s) | ~21 | **42.2** | ~2.0× |
 | Decode, 9.3K-token summarisation (t/s) | ~21 | **42.1** | ~2.0× |
-| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **~1520** | ~1.9× |
+| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **1711** (`-b 4096 -ub 256`) | ~2.1× |
 | Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **~1450** | ~1.9× |
 | Prefill @ 64K context depth (t/s) | 223 | 492 | 2.2× |
 | Prefill @ 224K context depth (t/s) | 152 | 383 | 2.5× |
@@ -136,6 +136,9 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | RDNA4 small-K MMVQ (rows per block = warps per block for short rows) | Q4_K gate/up 129 → 87 µs on navi48 alone, but no end-to-end gain on top of the single-token MoE routing (73.3 vs 73.3 t/s) |
 | `HIP_FORCE_DEV_KERNARG=1` (Qwen3.8 decode) | No change (52.14 vs 52.16 code) |
 | `--backend-sampling` (Qwen3.8) | Doesn't engage: this ROCm build lacks TOP_K / ARGSORT for a 248K-token vocabulary, so sampling falls back to the CPU; −5% prefill on a 9.3K prompt |
+| ggml-org **[#25940](https://github.com/ggml-org/llama.cpp/pull/25940)** (RDNA4 Q6_K/Q2_K MMQ fixes + MMQ/hipBLAS crossovers) on `app-7f2bd32` | North prefill pp512 / 2048 / 8192: 2472 / 3550 / 3733 → 2493 / 3573 / 3758 (+0.6–0.8%); Qwen3.8 pp4096 1711 → 1713. Tests pass (162/162). With it, bypassing the mixed-arch routing (`GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1`) is +2% on North prefill but −5.6% on Qwen3.8. Branch `exp/mmq-25940` |
+| navi44 at DPM `high` while serving | navi44 already runs at ~3.0 GHz (of 3.19) and is nearly always busy during decode; little to gain |
+| COMPUTE power profile (`pp_power_profile_mode=5`, both cards, instead of the navi48 watcher) | Qwen3.8 MTP decode −11% (42.2 / 54.9 / 42.3 → 37.7 / 49.2 / 38.0) and 9.3K prefill −5%; North +2–4% (navi48 boosts to 3.3 GHz under it, but its median clock while busy drops from 2.46 to 1.68 GHz) |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
 
 ## Environment knobs added by this fork
