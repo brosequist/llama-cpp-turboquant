@@ -14,16 +14,16 @@ process**, serving through llama-swap in a k3s cluster.
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `exp/moe-sum` (`deploy/rocm101-stack` + single-token MoE routing + fused decode MoE sum) plus the navi48 clock watcher and `--tensor-split 1.3,1`, deployed 2026-10-26,
+this work, without MTP. **After** is `exp/qwen-q5k` (deployed 2026-10-26 as `app-7f2bd32`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--tensor-split 1.3,1`,
 measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| Decode, code prompt (t/s) | ~21 (no speculation) | **52.1** | **~2.5×** |
-| Decode, prose prompt (t/s) | ~21 | **41.5** | ~2.0× |
-| Decode, 9.3K-token summarisation (t/s) | ~21 | **39.3** | ~1.9× |
+| Decode, code prompt (t/s) | ~21 (no speculation) | **54.8** | **~2.6×** |
+| Decode, prose prompt (t/s) | ~21 | **42.2** | ~2.0× |
+| Decode, 9.3K-token summarisation (t/s) | ~21 | **42.1** | ~2.0× |
 | Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **~1520** | ~1.9× |
-| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **1451** | ~1.9× |
+| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **~1450** | ~1.9× |
 | Prefill @ 64K context depth (t/s) | 223 | 492 | 2.2× |
 | Prefill @ 224K context depth (t/s) | 152 | 383 | 2.5× |
 | KL divergence vs f16 KV (turbo4) | 0.0080 | 0.0065 | lower is better |
@@ -137,6 +137,22 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | `HIP_FORCE_DEV_KERNARG=1` (Qwen3.8 decode) | No change (52.14 vs 52.16 code) |
 | `--backend-sampling` (Qwen3.8) | Doesn't engage: this ROCm build lacks TOP_K / ARGSORT for a 248K-token vocabulary, so sampling falls back to the CPU; −5% prefill on a 9.3K prompt |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
+
+## Environment knobs added by this fork
+
+Every behaviour change below can be turned off at run time, which is how each one was A/B'd.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `GGML_CUDA_MMVQ_MOE_N1=0` | on | Single-token `MUL_MAT_ID` goes back to the generic mmvq kernel (RDNA4 only) |
+| `GGML_CUDA_MOE_WEIGHTED_REDUCTION=0` | on | Disables the fused MoE weighted expert sum (#25952 and the decode-form matcher) |
+| `GGML_CUDA_MMVQ_FUSE_NCOLS=0` | on | Gate/up + GLU fusion stays single-token only (RDNA4 only) |
+| `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1` | off | Skips the chunked mmf/mmvf routing for mixed-arch GEMMs and uses rocBLAS (needs ROCm ≥ 7.12; slower here) |
+| `GGML_CUDA_GDN_LEGACY=1` | off | Uses the original column-per-thread GATED_DELTA_NET kernel instead of the row-per-warp port |
+| `LLAMA_MTP_DRAFT_VOCAB=<rows>` | off | Keeps only the first rows of the MTP draft's output head (#31037 port); production uses 65536 |
+| `LLAMA_MTP_PROF=1` | off | Logs per-batch target decode vs MTP `process()` / draft time (adds syncs) |
+
+TheTom's own knobs (`GGML_CUDA_Q8CACHE`, `GGML_CUDA_FUSE_CHAIN`, `TURBO_*`, …) are listed in AGENTS.md.
 
 ## Branches
 
