@@ -2798,7 +2798,10 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_f(const ggml_tensor * tensor) {
     return use_mul_mat_vec_f;
 }
 
-static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+// gate_only: the caller fuses only a gate matrix + GLU (no biases or scales). On RDNA4 that form is also
+// fused for 2-4 dst columns (MTP/speculative verify batches): the mmvq kernel loops the gate over columns,
+// but its bias loads index a per-column bias, so biased fusion stays single-column.
+static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor, bool gate_only = false) {
     ggml_tensor *       src0 = tensor->src[0];
     ggml_tensor *       src1 = tensor->src[1];
     const ggml_tensor * dst  = tensor;
@@ -2820,8 +2823,11 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
-    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
+    //we only support fusion for ncols_dst = 1, except gate-only fusion on RDNA4 up to 4 columns
+    static const bool fuse_ncols = [] { const char * e = getenv("GGML_CUDA_MMVQ_FUSE_NCOLS"); return e == nullptr || atoi(e) != 0; }();
+    const bool multi_col_ok = gate_only && fuse_ncols && GGML_CUDA_CC_IS_RDNA4(cc) && dst->ne[1] <= 4 &&
+                              dst->ne[2] == 1 && dst->ne[3] == 1;
+    if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1 && !multi_col_ok) {
         return false;
     }
 
@@ -5747,7 +5753,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up, /*gate_only =*/ true)) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate   = gate->src[0];
                 fusion_data.glu_op = ggml_get_glu_op(glu);
