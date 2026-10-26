@@ -6599,6 +6599,9 @@ struct test_moe_weighted_reduction : public test_case {
         return "MOE_WEIGHTED_REDUCTION";
     }
 
+    // fork: the fused kernel must fire for k <= 15 (k = 16 is the per-op fallback case)
+    const char * required_fusion() override { return n_expert_used <= 15 ? "moe_weighted_reduction" : nullptr; }
+
     bool run_whole_graph() override { return true; }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
@@ -6644,6 +6647,40 @@ struct test_moe_weighted_reduction : public test_case {
             }
         }
         ggml_set_name(out, "moe_weighted_reduction");
+        return out;
+    }
+};
+
+// fork: decode form of the MoE expert sum (build_moe_ffn, n_tokens == 1):
+// MUL(experts, weights) -> PERMUTE(1, 0, 2, 3) -> CONT -> SUM_ROWS
+struct test_moe_weighted_sum_rows : public test_case {
+    const int64_t n_embd;
+    const int64_t n_expert_used;
+
+    test_moe_weighted_sum_rows(int64_t n_embd, int64_t n_expert_used) : n_embd(n_embd), n_expert_used(n_expert_used) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(n_embd, n_expert_used);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_WEIGHTED_SUM_ROWS";
+    }
+
+    const char * required_fusion() override { return "moe_weighted_reduction"; }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * experts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_expert_used, 1);
+        ggml_tensor * weights = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_expert_used, 1);
+        ggml_set_name(experts, "experts");
+        ggml_set_name(weights, "weights");
+        ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
+        ggml_tensor * pe       = ggml_cont(ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3));
+        ggml_tensor * out      = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, pe), n_embd, 1);
+        ggml_set_name(out, "out");
         return out;
     }
 };
@@ -11031,6 +11068,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_reduction(63,   12, 33, true,  true, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 15, 40, false, true));
     test_cases.emplace_back(new test_moe_weighted_reduction(2048, 16, 32, false, true));
+    test_cases.emplace_back(new test_moe_weighted_sum_rows(2048, 8));
+    test_cases.emplace_back(new test_moe_weighted_sum_rows(63, 2));
+    test_cases.emplace_back(new test_moe_weighted_sum_rows(4096, 15));
     // fork: north decode + n-gram verify batches (n_embd 2048, k 8)
     for (int64_t nt : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, nt));

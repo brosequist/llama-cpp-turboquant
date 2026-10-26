@@ -4751,6 +4751,66 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 }
 
 
+// fork: the decode form of the MoE expert sum (llm_graph_context::build_moe_ffn, n_tokens == 1):
+//   MUL(experts, router_weight) -> PERMUTE(1, 0, 2, 3) -> CONT -> SUM_ROWS
+// Same arithmetic as the view/add form above; SUM_ROWS's [1, n_embd, 1] output has the same memory
+// layout as [n_embd, 1], so the fused kernel writes it directly. Unfused this is three kernels per layer,
+// with SUM_ROWS launching one wave per row of n_expert_used values.
+static bool ggml_cuda_match_moe_weighted_sum_rows(
+        const ggml_cgraph * cgraph,
+        int node_idx,
+        ggml_cuda_moe_weighted_reduction_match & match) {
+    if (node_idx + 3 >= cgraph->n_nodes) {
+        return false;
+    }
+    const ggml_tensor * mul  = cgraph->nodes[node_idx];
+    const ggml_tensor * perm = cgraph->nodes[node_idx + 1];
+    const ggml_tensor * cont = cgraph->nodes[node_idx + 2];
+    ggml_tensor *       sum  = cgraph->nodes[node_idx + 3];
+    if (mul->op != GGML_OP_MUL || perm->op != GGML_OP_PERMUTE || cont->op != GGML_OP_CONT || sum->op != GGML_OP_SUM_ROWS) {
+        return false;
+    }
+    if (perm->src[0] != mul || cont->src[0] != perm || sum->src[0] != cont) {
+        return false;
+    }
+    if (mul->type != GGML_TYPE_F32 || sum->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || !ggml_is_contiguous(sum)) {
+        return false;
+    }
+    const ggml_tensor * experts = nullptr;
+    const ggml_tensor * weights = nullptr;
+    for (int s = 0; s < 2; ++s) {
+        const ggml_tensor * a = mul->src[s];
+        const ggml_tensor * b = mul->src[1 - s];
+        if (a && b && a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32 && ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
+                ggml_are_same_shape(a, mul) && b->ne[0] == 1 && b->ne[1] == mul->ne[1] && b->ne[2] == mul->ne[2] && b->ne[3] == mul->ne[3]) {
+            experts = a;
+            weights = b;
+            break;
+        }
+    }
+    const int64_t n_embd        = mul->ne[0];
+    const int64_t n_expert_used = mul->ne[1];
+    const int64_t n_tokens      = mul->ne[2] * mul->ne[3];
+    if (experts == nullptr || n_expert_used < 2 || n_tokens != 1) {
+        return false;
+    }
+    // PERMUTE(1, 0, 2, 3): the CONT is [n_expert_used, n_embd, ...] and SUM_ROWS reduces over the experts
+    if (cont->ne[0] != n_expert_used || cont->ne[1] != n_embd || sum->ne[0] != 1 || ggml_nelements(sum) != n_embd * n_tokens) {
+        return false;
+    }
+    const ggml_op ops[4]  = { GGML_OP_MUL, GGML_OP_PERMUTE, GGML_OP_CONT, GGML_OP_SUM_ROWS };
+    const int output_idx  = node_idx + 3;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, 4, ops, &output_idx, 1)) {
+        return false;
+    }
+    match.experts      = experts;
+    match.expert_scale = nullptr;
+    match.weights      = weights;
+    match.dst          = sum;
+    match.node_count   = 4;
+    return true;
+}
+
 static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
                                int                                       node_idx,
                                std::initializer_list<enum ggml_op>       ops,
@@ -5182,11 +5242,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                    std::atoi(getenv("GGML_CUDA_MOE_WEIGHTED_REDUCTION")) == 0;
     if (node->op == GGML_OP_MUL && !moe_wr_off) {
         ggml_cuda_moe_weighted_reduction_match match;
-        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+        if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) ||
+                ggml_cuda_match_moe_weighted_sum_rows(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                cuda_ctx->fusion_stats.moe_weighted_reduction++;
                 return match.node_count - 1;
             }
         }
@@ -7500,6 +7562,9 @@ int64_t ggml_backend_cuda_fusion_count(ggml_backend_t backend, const char * name
     }
     if (strcmp(name, "mul_mat_glu") == 0) {
         return ctx->fusion_stats.mul_mat_glu;
+    }
+    if (strcmp(name, "moe_weighted_reduction") == 0) {
+        return ctx->fusion_stats.moe_weighted_reduction;
     }
     return -1;
 }
