@@ -1514,6 +1514,8 @@ struct ggml_backend_cuda_context {
                                      // same-shape residual: both arrive as fusion x_bias)
         int64_t mul_mat_glu   = 0;   // GLU epilogues folded into mul_mat_vec
         int64_t moe_weighted_reduction = 0; // MoE expert sums run as one kernel (both graph forms)
+        int64_t batched_cpy   = 0;   // runs of same-layout f32 CPYs launched as one kernel
+        int64_t add_rms_norm  = 0;   // residual ADD folded into the following RMS_NORM + MUL
     } fusion_stats;
     // Landing slots for paged-in experts. One slab per expert tensor, n_slots experts wide; the
     // address table is pointed at a slot instead of at the expert's home address once it is copied.

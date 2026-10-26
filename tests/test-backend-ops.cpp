@@ -6890,6 +6890,117 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// Residual ADD -> RMS_NORM -> MUL(weight), with the sum read again afterwards (the residual stream).
+struct test_add_rms_norm_mul : public test_case {
+    const std::array<int64_t, 4> ne;
+    const float eps;
+
+    test_add_rms_norm_mul(std::array<int64_t, 4> ne, float eps = 1e-6f) : ne(ne), eps(eps) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(ne, eps);
+    }
+
+    const char * required_fusion() override { return "add_rms_norm"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ADD_RMS_NORM_MUL";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * b = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(a, "a");
+        ggml_set_name(b, "b");
+        ggml_set_name(w, "w");
+
+        ggml_tensor * s   = ggml_add(ctx, a, b);
+        ggml_tensor * n   = ggml_mul(ctx, ggml_rms_norm(ctx, s, eps), w);
+        ggml_tensor * out = ggml_add(ctx, n, s);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// K CPYs of sliding windows of one tensor into K slots of another, as Qwen3.5/3.8 GDN layers write their
+// conv-state rollback windows (delta-net-base.cpp). The CUDA backend runs the run as one launch.
+struct test_cpy_batched : public test_case {
+    const int64_t C;      // channels
+    const int64_t T;      // new tokens
+    const int64_t K;      // windows / slots
+
+    test_cpy_batched(int64_t C, int64_t T, int64_t K) : C(C), T(T), K(K) {}
+
+    std::string vars() override {
+        return VARS_TO_STR3(C, T, K);
+    }
+
+    const char * required_fusion() override { return K >= 2 ? "batched_cpy" : nullptr; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CPY_BATCHED";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t w = 3; // conv window (kernel size - 1)
+        ggml_tensor * in    = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w + T, C, 1);
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w*C, K);
+        ggml_set_name(in, "in");
+        ggml_set_name(cache, "cache");
+
+        std::vector<ggml_tensor *> outs;
+        for (int64_t t = 1; t <= K; ++t) {
+            const int64_t s_idx  = std::max<int64_t>(0, T - K + t);
+            const int64_t s_slot = K - t;
+            ggml_tensor * src = ggml_view_3d(ctx, in, w, C, 1, in->nb[1], in->nb[2], ggml_row_size(GGML_TYPE_F32, s_idx));
+            ggml_tensor * dst = ggml_view_2d(ctx, cache, w*C, 1, cache->nb[1], s_slot*cache->nb[1]);
+            outs.push_back(ggml_cpy(ctx, src, dst));
+        }
+        // right-nested sum, so the graph visits the CPYs back to back before any consumer
+        ggml_tensor * out = outs.back();
+        for (int64_t k = (int64_t) outs.size() - 2; k >= 0; --k) {
+            out = ggml_add(ctx, outs[k], out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// CONCAT along dim 0 of a narrow window and a transposed activation: the Qwen3.5/3.8 GDN conv input
+// [3 + n_tokens, channels]. Exercises the narrow non-contiguous dim-0 concat path.
+struct test_concat_transposed : public test_case {
+    const int64_t C;
+    const int64_t T;
+
+    test_concat_transposed(int64_t C, int64_t T) : C(C), T(T) {}
+
+    std::string vars() override {
+        return VARS_TO_STR2(C, T);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "CONCAT_TRANSPOSED";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 3, C, 1);
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, C, T);
+        ggml_set_name(a, "a");
+        ggml_set_name(x, "x");
+        ggml_tensor * out = ggml_concat(ctx, a, ggml_transpose(ctx, x), 0);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // ADD(x, row) -> SOFTPLUS -> MUL(row): the GDN dt/A gate of Qwen3.5/3.8 over a multi-token batch, where
 // the per-head bias and A are single rows broadcast over the tokens.
 struct test_elem_chain_row_bcast : public test_case {
@@ -9098,6 +9209,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 4, 1, 1}));
+    for (auto ne : std::vector<std::array<int64_t, 4>>{ {5120, 1, 1, 1}, {5120, 4, 1, 1}, {4096, 3, 2, 1}, {256, 5, 1, 1}, {64, 1, 1, 1} }) {
+        test_cases.emplace_back(new test_add_rms_norm_mul(ne));
+    }
+    for (int64_t K : {1, 2, 4}) {
+        test_cases.emplace_back(new test_cpy_batched(64, 4, K));
+        test_cases.emplace_back(new test_cpy_batched(10240, 1, K));
+    }
+    for (int64_t T : {1, 2, 4, 8}) {
+        test_cases.emplace_back(new test_concat_transposed(10240, T));
+        test_cases.emplace_back(new test_concat_transposed(33, T));
+    }
     test_cases.emplace_back(new test_elem_chain_row_bcast({48, 1, 1, 1}));
     test_cases.emplace_back(new test_elem_chain_row_bcast({63, 5, 1, 1}));
     test_cases.emplace_back(new test_elem_chain_row_bcast({128, 3, 2, 1}));
