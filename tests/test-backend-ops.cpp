@@ -6890,6 +6890,40 @@ struct test_mul_mat_shared_src1 : public test_case {
     }
 };
 
+// ADD(x, row) -> SOFTPLUS -> MUL(row): the GDN dt/A gate of Qwen3.5/3.8 over a multi-token batch, where
+// the per-head bias and A are single rows broadcast over the tokens.
+struct test_elem_chain_row_bcast : public test_case {
+    const std::array<int64_t, 4> ne;
+
+    test_elem_chain_row_bcast(std::array<int64_t, 4> ne) : ne(ne) {}
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    const char * required_fusion() override { return "elem_chain"; }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "ELEM_CHAIN_ROW_BCAST";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x    = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_tensor * bias = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_tensor * a    = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+        ggml_set_name(x, "x");
+        ggml_set_name(bias, "bias");
+        ggml_set_name(a, "a");
+
+        ggml_tensor * out = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, x, bias)), a);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // A run of elementwise ops with same-shape and single-value operands, including the two
 // activations whose fused forms must round exactly like the unary kernels (GELU, SOFTPLUS).
 struct test_elem_chain_fusion : public test_case {
@@ -9063,6 +9097,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false));
+    test_cases.emplace_back(new test_elem_chain_row_bcast({48, 4, 1, 1}));
+    test_cases.emplace_back(new test_elem_chain_row_bcast({48, 1, 1, 1}));
+    test_cases.emplace_back(new test_elem_chain_row_bcast({63, 5, 1, 1}));
+    test_cases.emplace_back(new test_elem_chain_row_bcast({128, 3, 2, 1}));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, true));
     test_cases.emplace_back(new test_elem_chain_fusion({256, 4, 2, 1}, false, false, false, 0.25f));

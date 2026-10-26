@@ -5115,9 +5115,13 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
 
             if (!chain_ok_tensor(a)) break;
             if (binary && !chain_ok_tensor(b)) break;
-            // operand may be same-shape, or a single value broadcast over the run
-            const bool a_b = chain_ok_tensor(a) && (ggml_are_same_shape(a, nd) || ggml_nelements(a) == 1);
-            const bool b_b = !binary || (chain_ok_tensor(b) && (ggml_are_same_shape(b, nd) || ggml_nelements(b) == 1));
+            // operand may be same-shape, a single value, or one row repeated over the rows (e.g. the
+            // per-head dt bias and A of Qwen3.5/3.8 GDN layers over a multi-token MTP verify batch)
+            auto is_row = [&](const ggml_tensor * t) {
+                return t->ne[0] == nd->ne[0] && ggml_nelements(t) == t->ne[0] && ggml_nrows(nd) > 1;
+            };
+            const bool a_b = chain_ok_tensor(a) && (ggml_are_same_shape(a, nd) || ggml_nelements(a) == 1 || is_row(a));
+            const bool b_b = !binary || (chain_ok_tensor(b) && (ggml_are_same_shape(b, nd) || ggml_nelements(b) == 1 || is_row(b)));
             if (!a_b || !b_b) break;
 
             const ggml_tensor * other = nullptr;
@@ -5146,7 +5150,8 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
                 if (is_intermediate) break;
             }
 
-            desc.bcast[len]         = other ? (ggml_nelements(other) == 1 ? 1 : 0) : 0;
+            desc.bcast[len]         = !other ? 0 : ggml_nelements(other) == 1 ? 1 :
+                                      ggml_are_same_shape(other, nd) ? 0 : 2;
             desc.code[len]          = code;
             desc.other[len]         = other ? (const float *) other->data : nullptr;
             desc.chain_is_lhs[len]  = chain_lhs;
@@ -5223,7 +5228,8 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
             ggml_are_same_shape(out, cgraph->nodes[i]) &&
             ggml_can_fuse_subgraph(cgraph, i, len, ops_ch, out_ch, 1)) {
 
-            desc.n_ops = len;
+            desc.n_ops   = len;
+            desc.row_len = out->ne[0];
             ctx.fusion_stats.elem_chain++;
             ggml_cuda_op_elem_chain(ctx, (const float *) head_src->data,
                                     (float *) out->data, ggml_nelements(out), desc);
