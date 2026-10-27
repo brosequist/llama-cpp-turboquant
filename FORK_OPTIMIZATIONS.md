@@ -14,7 +14,7 @@ process**, serving through llama-swap in a k3s cluster.
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `exp/small-fusions` (deployed 2026-10-26 as `app-6224105`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--tensor-split 1.3,1`,
+this work, without MTP. **After** is `exp/rope-q8-setrows` (deployed 2026-10-27 as `app-e7b5abb`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--tensor-split 1.3,1`,
 measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
@@ -39,6 +39,7 @@ North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench t
 | Write new code from scratch | 58.4 | 58.0 | unchanged |
 | Write new code from scratch, single-token MoE routing (deployed 2026-10-26) | 58.2 | **73.3** | **+26%** |
 | Write new code from scratch, + fused MoE sum and `--device ROCm1,ROCm0` (deployed 2026-10-26) | 58.2 | **80.9** | **+39%** |
+| Write new code from scratch, + merged QKV GGUF and the decode kernel cuts (deployed 2026-10-27) | 58.2 | **88.2** | **+52%** |
 | Rewrite a file, first 1200 tokens, single-token MoE routing (deployed) | 163.7 | **180.8** | +10% |
 
 The last two rows are a separate same-session A/B (1200-token completions, `--spec-type ngram-simple`); see the Decode table.
@@ -106,6 +107,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **Gate/up + GLU fused for 2–4-token batches on RDNA4, and row-broadcast operands in the elementwise chain** (ours, `exp/qwen-q5k`). MTP verify batches ran gate, up and GLU as three kernels, and GDN's ADD → SOFTPLUS → MUL as three. `GGML_CUDA_MMVQ_FUSE_NCOLS=0` disables the first. Outputs token-identical | Qwen3.8 + MTP: summary / code / prose | 42.1 / 54.8 / 42.3 | 42.2 / 54.9 / 42.4 |
 | **Three small decode fusions** (ours, `exp/small-fusions`, deployed 2026-10-26 as `app-6224105`). The MTP verify step launches ~2,400 kernels at ~2.5 µs of HIP dispatch gap each, so removing launches pays directly. (1) Narrow dim-0 CONCAT (ne0 ≤ 32, e.g. the GDN conv-state window) gets a one-thread-per-element kernel instead of the generic one. (2) Runs of consecutive same-layout f32 CPYs (state snapshots) go out as one launch (`GGML_CUDA_BATCHED_CPY=0` disables). (3) The residual ADD folds into the following RMS_NORM + MUL (`GGML_CUDA_ADD_RMS_NORM=0` disables). Outputs token-identical; North unchanged (81.5) | Qwen3.8 + MTP: summary / code / prose | 42.2 / 54.9 / 42.3 | 43.2 / 56.3 / 43.5 |
 
+| **Merged Q/K/V weights for North** (model file, not fork code, deployed 2026-10-27). The GGUF ships `attn_q`, `attn_k` and `attn_v` as separate tensors, so every layer ran three matmuls on the same input. An offline rewrite stacks them into one `attn_qkv` tensor per layer (rows Q\|K\|V, bytes copied unchanged), which the `cohere2moe` loader already accepts. `GGML_CUDA_GRAPH_OPT=1` asserts with the merged file, so leave it off | North `llama-bench tg128`, empty context | 82.8 | 85.2 |
+| **North decode kernel cuts** (ours, `exp/rope-q8-setrows`, deployed 2026-10-27 as `app-e7b5abb`). A rocprofv3 trace of North decode showed the GPUs 66% busy, with 28% lost to launch gaps, so this removes launches. (1) K's rope writes straight into the q8_0 KV cache: the existing ROPE + VIEW + SET_ROWS fusion only handled f16/f32 caches, and never fired on North because its iswa graph put the V view between them (now K is expanded last). `GGML_CUDA_ROPE_Q8_FUSE=0` disables. (2) The q8_1 quantize cache holds two entries and also serves MUL_MAT_ID, so the MoE gate/up reuse the quantization of `attn_norm` made for QKV (North's attention and MoE run in parallel off the same norm). (3) Both residual ADDs fold into the MoE weighted reduction; when its output aliases recycled expert memory, a single-block staged variant runs instead (`GGML_CUDA_MOE_WR_ADDS=0` disables). The rope fusion rounds differently in the last bit; against an f16 KV cache it is as close as before (KLD 0.0081 vs 0.0084). Qwen3.8 output token-identical, decode +0.5% | North llama-server fresh code; 9K-context decode | 85.2; 79.1 | 88.2; 81.7 |
 ### Mainline cherry-picks (batch 1: correctness and security)
 
 [#28198](https://github.com/ggml-org/llama.cpp/pull/28198) (concurrent streams per split on multi-GPU), [#28475](https://github.com/ggml-org/llama.cpp/pull/28475) (races in mmid/mmf), [#28068](https://github.com/ggml-org/llama.cpp/pull/28068) (GDN q/k l2-norm matches FLA:
@@ -140,6 +143,8 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | ggml-org **[#25940](https://github.com/ggml-org/llama.cpp/pull/25940)** (RDNA4 Q6_K/Q2_K MMQ fixes + MMQ/hipBLAS crossovers) on `app-7f2bd32` | North prefill pp512 / 2048 / 8192: 2472 / 3550 / 3733 → 2493 / 3573 / 3758 (+0.6–0.8%); Qwen3.8 pp4096 1711 → 1713. Tests pass (162/162). With it, bypassing the mixed-arch routing (`GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1`) is +2% on North prefill but −5.6% on Qwen3.8. Branch `exp/mmq-25940` |
 | navi44 at DPM `high` while serving | navi44 already runs at ~3.0 GHz (of 3.19) and is nearly always busy during decode; little to gain |
 | COMPUTE power profile (`pp_power_profile_mode=5`, both cards, instead of the navi48 watcher) | Qwen3.8 MTP decode −11% (42.2 / 54.9 / 42.3 → 37.7 / 49.2 / 38.0) and 9.3K prefill −5%; North +2–4% (navi48 boosts to 3.3 GHz under it, but its median clock while busy drops from 2.46 to 1.68 GHz) |
+| DRY sampler as a loop guard for North (`--dry-multiplier 0.8`) | Two of 37 long North reasoning runs repeated a checklist block 28–33×. DRY didn't stop the repeating seed, and one fresh-code check failed that passed without it |
+| `--backend-sampling` for North | Doesn't engage either: no TOP_K / ARGSORT on this ROCm build, and llama-server turns it off under speculation (`ngram-simple`) |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
 
 ## Environment knobs added by this fork
@@ -153,6 +158,8 @@ Every behaviour change below can be turned off at run time, which is how each on
 | `GGML_CUDA_MMVQ_FUSE_NCOLS=0` | on | Gate/up + GLU fusion stays single-token only (RDNA4 only) |
 | `GGML_CUDA_BATCHED_CPY=0` | on | Consecutive same-layout f32 CPYs run as separate launches again |
 | `GGML_CUDA_ADD_RMS_NORM=0` | on | Residual ADD runs as its own kernel before RMS_NORM + MUL |
+| `GGML_CUDA_ROPE_Q8_FUSE=0` | on | K rope runs separately from the q8_0 KV-cache write |
+| `GGML_CUDA_MOE_WR_ADDS=0` | on | Residual ADDs stay out of the MoE weighted reduction |
 | `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1` | off | Skips the chunked mmf/mmvf routing for mixed-arch GEMMs and uses rocBLAS (needs ROCm ≥ 7.12; slower here) |
 | `GGML_CUDA_GDN_LEGACY=1` | off | Uses the original column-per-thread GATED_DELTA_NET kernel instead of the row-per-warp port |
 | `LLAMA_MTP_DRAFT_VOCAB=<rows>` | off | Keeps only the first rows of the MTP draft's output head (#31037 port); production uses 65536 |
@@ -172,4 +179,4 @@ top of the 2026-10-24 code.
 `deploy/qwen38-mtp-tune`, `fix/mmq-oob-29953`, `fix/multigpu-mixed-arch-mmf-gemm` and
 `fix/cohere2moe-mixedarch-router-mmvf`.
 
-`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing. `exp/moe-sum` = `exp/moe-n1` + #25952 + the decode-form matcher (deployed 2026-10-26). `exp/qwen-q5k` = `exp/moe-sum` + the branchless Q4_K/Q5_K unpack, the cross-type q8 cache and the two multi-token fusions (deployed 2026-10-26 as `app-7f2bd32`). `exp/small-fusions` = `exp/qwen-q5k` + narrow CONCAT, batched CPY and ADD → RMS_NORM → MUL (deployed 2026-10-26 as `app-6224105`). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
+`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing. `exp/moe-sum` = `exp/moe-n1` + #25952 + the decode-form matcher (deployed 2026-10-26). `exp/qwen-q5k` = `exp/moe-sum` + the branchless Q4_K/Q5_K unpack, the cross-type q8 cache and the two multi-token fusions (deployed 2026-10-26 as `app-7f2bd32`). `exp/small-fusions` = `exp/qwen-q5k` + narrow CONCAT, batched CPY and ADD → RMS_NORM → MUL (deployed 2026-10-26 as `app-6224105`). `exp/rope-q8-setrows` = `exp/small-fusions` + the q8_0 rope fusion, two-entry quantize cache and residual-add folding (deployed 2026-10-27 as `app-e7b5abb`). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
