@@ -2,7 +2,7 @@
 
 > **brosequist fork:** TheTom's TurboQuant llama.cpp, plus fixes and tuning for a mixed-architecture dual-RDNA4 setup
 > (RX 9070 XT gfx1201 + RX 9060 XT gfx1200, layer split in one process). On Qwen3.8-27B (262K context, turbo4 KV, MTP):
-> **decode ~21 → 43–56 t/s, 4K-token prefill 808 → ~1710 t/s, 64K-depth prefill 223 → 492 t/s.** North-Mini-Code
+> **decode ~21 → 44–57 t/s, 4K-token prefill 808 → ~1710 t/s, 64K-depth prefill 223 → 492 t/s.** North-Mini-Code
 > (MoE): fresh-code decode 58 → 88 t/s, decode at 64K context 23.8 → 43.3 t/s, code edits 57 → 140+ t/s. Each change,
 > with before/after numbers and rejected experiments: **[FORK_OPTIMIZATIONS.md](FORK_OPTIMIZATIONS.md)**.
 >
