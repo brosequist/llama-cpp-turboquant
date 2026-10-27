@@ -2972,6 +2972,10 @@ struct test_rope_set_rows : public test_case {
         return "ROPE_SET_ROWS";
     }
 
+    // q8_0 destination: a last-bit difference in the rotated value can flip a rounding step
+    // (observed NMSE up to ~2e-7 vs the CPU reference, i.e. a handful of elements one step off)
+    double max_nmse_err() override { return type == GGML_TYPE_Q8_0 ? 1e-6 : 1e-7; }
+
     bool run_whole_graph() override { return true; }
 
     test_rope_set_rows(ggml_type type,

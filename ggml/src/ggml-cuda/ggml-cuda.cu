@@ -5331,9 +5331,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int           n_ext   = ggml_cuda_moe_wr_fold_adds(cgraph, i, match.node_count, match.dst, adds, add_dst);
             if (n_ext > match.node_count) {
                 const int ext_out = i + n_ext - 1;
-                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ext, &ext_out, 1)) {
+                // The folded output often lands in memory recycled from the expert outputs, which the
+                // range check (rightly) rejects for the column-parallel kernel; for one token the staged
+                // kernel reads the whole row before writing, so any overlap is safe.
+                const bool ranges_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ext, &ext_out, 1);
+                const bool staged    = !ranges_ok && ggml_nelements(add_dst) == match.experts->ne[0] &&
+                                       match.experts->ne[0] <= GGML_CUDA_MOE_WR_STAGED_MAX_EMBD;
+                if (ranges_ok || staged) {
                     ggml_cuda_op_moe_weighted_reduction(
-                        *cuda_ctx, match.experts, match.expert_scale, match.weights, add_dst, adds[0], adds[1]);
+                        *cuda_ctx, match.experts, match.expert_scale, match.weights, add_dst, adds[0], adds[1], staged);
                     cuda_ctx->fusion_stats.moe_weighted_reduction++;
                     return n_ext - 1;
                 }
