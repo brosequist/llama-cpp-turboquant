@@ -9460,6 +9460,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // q8_0 KV cache: fused for NORMAL rope (CUDA/HIP quantizing store), unfused fallback for the rest
+    for (int mode : { GGML_ROPE_TYPE_NORMAL, GGML_ROPE_TYPE_NEOX }) {
+        for (int ne2 : {1, 8, 512}) {
+            test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I64, { 128, 32, ne2, 1 }, mode));
+            test_cases.emplace_back(new test_rope_set_rows(GGML_TYPE_Q8_0, GGML_TYPE_I64, { 128,  4, ne2, 3 }, mode));
+        }
+    }
 
     for (ggml_type type_input : {GGML_TYPE_F32}) {
         for (ggml_op_pool pool_type : {GGML_OP_POOL_AVG, GGML_OP_POOL_MAX}) {
