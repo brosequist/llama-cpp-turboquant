@@ -1457,17 +1457,27 @@ struct ggml_backend_cuda_context {
     // collide into one decorated name and the linker rejects the object (LNK1179).
     struct retired_buf { char * ptr; size_t cap; int dev; };
 
+    // Two entries, least recently used replaced: in a parallel attention/MoE block (cohere2moe)
+    // the attention output projection quantizes its own input between the QKV and the MoE
+    // gate/up reads of attn_norm, which evicted a single entry. Keyed on the underlying tensor
+    // (view_src root) so a reshaped view of the same data hits, plus the layout below.
     struct {
         char *              ptr  = nullptr;      // raw device memory (not pool), grow-only
         size_t              cap  = 0;            // usable bytes
         int                 dev  = -1;           // device the buffer was allocated on
-        const ggml_tensor * src1 = nullptr;      // key: tensor identity ...
-        const void *        data = nullptr;      // ... and its data pointer
+        const ggml_tensor * root = nullptr;      // key: underlying tensor (src1, or its view_src) ...
+        const void *        data = nullptr;      // ... and src1's data pointer
         uint64_t            epoch = 0;           // valid only within this graph eval
+        uint64_t            used  = 0;           // LRU stamp
         size_t              size = 0;            // quantized bytes
-        int64_t             ne10_padded = 0;     // layout keys
+        int64_t             ne10_padded = 0;     // layout keys: padded row, then either a contiguous
+        bool                contig = false;      // src1 with the same row count, or the exact same
+        int64_t             nrows = 0;           // ne11..13 and strides
+        int64_t             ne[3]  = {0, 0, 0};
+        size_t              nb[3]  = {0, 0, 0};
         std::vector<retired_buf> retired;        // outgrown buffers, freed at teardown (captured graphs may still use them)
-    } q8_cache;
+    } q8_cache[2];
+    uint64_t q8_cache_clock = 0;
 
     // Same idea for the TQ activation pre-rotation (forward block WHT + q8_1 quantize): the MoE
     // gate and up projections consume the same normed activation, so the rotation ran twice per
