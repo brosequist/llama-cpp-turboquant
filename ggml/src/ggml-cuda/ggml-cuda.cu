@@ -4309,6 +4309,10 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
     // 16-thread group that takes a single path (all rotated or all pass-through), and no thread of
     // a 32-wide warp may have exited early (head dim a multiple of 64) since the scale is shuffled.
     if (set_rows->type == GGML_TYPE_Q8_0) {
+        static const bool enabled = getenv("GGML_CUDA_ROPE_Q8_FUSE") == nullptr || atoi(getenv("GGML_CUDA_ROPE_Q8_FUSE")) != 0;
+        if (!enabled) {
+            return false;
+        }
         const int mode   = ((const int32_t *) rope->op_params)[2];
         const int n_dims = ((const int32_t *) rope->op_params)[1];
         if (mode != GGML_ROPE_TYPE_NORMAL || rope->src[0]->type != GGML_TYPE_F32 ||
