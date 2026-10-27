@@ -11341,6 +11341,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // MoE router GEMV at decode (cohere2moe ffn_gate_inp: 128 experts x 2048, f32 weights; 1-4 tokens with n-gram drafts)
+    for (ggml_type type_a : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16}) {
+        for (int n : {1, 2, 4}) {
+            test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, 128, n, 2048, {1, 1}, {1, 1}));
+        }
+    }
+    // same GEMV at other sizes: on RDNA4 some (rows, block size) combinations run 3-5x slower (see mmvf.cu small_bs)
+    for (int k : {2048, 2080, 2112, 4096}) {
+        for (int m : {128, 256, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32, m, 1, k, {1, 1}, {1, 1}));
+        }
+    }
+
     // elementwise chain vs the tuned multi-ADD kernel (GGML_CUDA_FUSE_CHAIN=0 to compare)
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, true));
     test_cases.emplace_back(new test_elem_chain_fusion({4096, 64, 1, 1}, false, false, false, 0.25f));
