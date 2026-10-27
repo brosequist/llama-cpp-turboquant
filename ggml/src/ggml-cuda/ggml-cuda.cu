@@ -4281,8 +4281,20 @@ static bool ggml_cuda_should_fuse_rope_set_rows(const ggml_tensor * rope,
         return false;
     }
 
-    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16) {
+    if (set_rows->type != GGML_TYPE_F32 && set_rows->type != GGML_TYPE_F16 && set_rows->type != GGML_TYPE_Q8_0) {
         return false;
+    }
+
+    // q8_0 cache: only rope_norm has the quantizing store. A q8_0 block must be one aligned
+    // 16-thread group that takes a single path (all rotated or all pass-through), and no thread of
+    // a 32-wide warp may have exited early (head dim a multiple of 64) since the scale is shuffled.
+    if (set_rows->type == GGML_TYPE_Q8_0) {
+        const int mode   = ((const int32_t *) rope->op_params)[2];
+        const int n_dims = ((const int32_t *) rope->op_params)[1];
+        if (mode != GGML_ROPE_TYPE_NORMAL || rope->src[0]->type != GGML_TYPE_F32 ||
+            rope->ne[0] % (2*QK8_0) != 0 || n_dims % QK8_0 != 0) {
+            return false;
+        }
     }
 
     if (set_rows->src[1]->type != GGML_TYPE_I64) {
