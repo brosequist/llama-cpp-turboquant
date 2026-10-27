@@ -14,7 +14,7 @@ process**, serving through llama-swap in a k3s cluster.
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `exp/rope-q8-setrows` (deployed 2026-10-27 as `app-e7b5abb`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--device ROCm1,ROCm0 --tensor-split 1,1.4` (the rog desktop moved to the iGPU on 2026-10-26, freeing navi48),
+this work, without MTP. **After** is `exp/router-mmvf` (deployed 2026-10-27 as `app-ce88c8c`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--device ROCm1,ROCm0 --tensor-split 1,1.4` (the rog desktop moved to the iGPU on 2026-10-26, freeing navi48),
 measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
@@ -40,6 +40,7 @@ North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench t
 | Write new code from scratch, single-token MoE routing (deployed 2026-10-26) | 58.2 | **73.3** | **+26%** |
 | Write new code from scratch, + fused MoE sum and `--device ROCm1,ROCm0` (deployed 2026-10-26) | 58.2 | **80.9** | **+39%** |
 | Write new code from scratch, + merged QKV GGUF and the decode kernel cuts (deployed 2026-10-27) | 58.2 | **88.2** | **+52%** |
+| Write new code from scratch, + the RDNA4 router GEMV fix (deployed 2026-10-27) | 58.2 | **89.4** | **+54%** |
 | Rewrite a file, first 1200 tokens, single-token MoE routing (deployed) | 163.7 | **180.8** | +10% |
 
 The last two rows are a separate same-session A/B (1200-token completions, `--spec-type ngram-simple`); see the Decode table.
@@ -109,6 +110,7 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 
 | **Merged Q/K/V weights for North** (model file, not fork code, deployed 2026-10-27). The GGUF ships `attn_q`, `attn_k` and `attn_v` as separate tensors, so every layer ran three matmuls on the same input. An offline rewrite stacks them into one `attn_qkv` tensor per layer (rows Q\|K\|V, bytes copied unchanged), which the `cohere2moe` loader already accepts. `GGML_CUDA_GRAPH_OPT=1` asserts with the merged file, so leave it off | North `llama-bench tg128`, empty context | 82.8 | 85.2 |
 | **North decode kernel cuts** (ours, `exp/rope-q8-setrows`, deployed 2026-10-27 as `app-e7b5abb`). A rocprofv3 trace of North decode showed the GPUs 66% busy, with 28% lost to launch gaps, so this removes launches. (1) K's rope writes straight into the q8_0 KV cache: the existing ROPE + VIEW + SET_ROWS fusion only handled f16/f32 caches, and never fired on North because its iswa graph put the V view between them (now K is expanded last). `GGML_CUDA_ROPE_Q8_FUSE=0` disables. (2) The q8_1 quantize cache holds two entries and also serves MUL_MAT_ID, so the MoE gate/up reuse the quantization of `attn_norm` made for QKV (North's attention and MoE run in parallel off the same norm). (3) Both residual ADDs fold into the MoE weighted reduction; when its output aliases recycled expert memory, a single-block staged variant runs instead (`GGML_CUDA_MOE_WR_ADDS=0` disables). The rope fusion rounds differently in the last bit; against an f16 KV cache it is as close as before (KLD 0.0081 vs 0.0084). Qwen3.8 output token-identical, decode +0.5% | North llama-server fresh code; 9K-context decode | 85.2; 79.1 | 88.2; 81.7 |
+| **RDNA4 mmvf block size for North's MoE router** (ours, `exp/router-mmvf`, deployed 2026-10-27 as `app-ce88c8c`). North's f32 router (`ffn_gate_inp`, 128 × 2048) cost 13.2 µs per layer on navi44 against 2.0 µs on navi48. A rocprofv3 kernel trace showed it is not bandwidth: RDNA4 has a 3–5× slow mode for some row-count × block-size combinations of `mul_mat_vec_f` (around 32K threads in flight on navi44, worst at power-of-two row lengths). On RDNA4, GEMVs with 65–128 rows now launch 128-thread blocks (3.1 µs on navi44; `GGML_CUDA_MMVF_SMALL_BS=0` disables). The lower bound matters: Qwen3.8's 48-row `ssm_alpha`/`ssm_beta` tensors slowed 8% under a ≤128 rule. The f32 loop is also unrolled (`GGML_CUDA_MMVF_UNROLL=0` disables), and North's logit scale of exactly 1.0 is skipped. KLD vs f16 0.0078 (was 0.0081); Qwen3.8 output byte-identical | North llama-server fresh code; 9K-context decode | 88.2; 81.8 | 89.4; 82.9 |
 | **Output layer on navi48 for Qwen3.8; more North layers on navi48** (launch flags, 2026-10-27). Once the rog desktop moved to the iGPU, navi48 had the headroom: Qwen3.8 now runs `--device ROCm1,ROCm0 --tensor-split 1,1.4`, which puts its 1 GB Q6_K output layer and the MTP draft head on the faster card (VRAM peak 10.2 GB navi44 / 16.0 GB navi48; pinning only `output.weight` with `-ot` instead halved prefill). North moved from `1,1` to `1,1.4`: fresh code 80.2 → 82.2, prefill +2% | Qwen3.8 + MTP: summary / code / prose; 9.3K prefill | 43.0 / 55.9 / 43.1; 1464 | 45.0 / 57.0 / 43.8; 1389 |
 
 ### Mainline cherry-picks (batch 1: correctness and security)
@@ -162,6 +164,8 @@ Every behaviour change below can be turned off at run time, which is how each on
 | `GGML_CUDA_ADD_RMS_NORM=0` | on | Residual ADD runs as its own kernel before RMS_NORM + MUL |
 | `GGML_CUDA_ROPE_Q8_FUSE=0` | on | K rope runs separately from the q8_0 KV-cache write |
 | `GGML_CUDA_MOE_WR_ADDS=0` | on | Residual ADDs stay out of the MoE weighted reduction |
+| `GGML_CUDA_MMVF_SMALL_BS=0` | on | 65–128-row mmvf GEMVs keep the default block size (RDNA4 only) |
+| `GGML_CUDA_MMVF_UNROLL=0` | on | The f32 GEMV inner loop is not unrolled |
 | `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1` | off | Skips the chunked mmf/mmvf routing for mixed-arch GEMMs and uses rocBLAS (needs ROCm ≥ 7.12; slower here) |
 | `GGML_CUDA_GDN_LEGACY=1` | off | Uses the original column-per-thread GATED_DELTA_NET kernel instead of the row-per-warp port |
 | `LLAMA_MTP_DRAFT_VOCAB=<rows>` | off | Keeps only the first rows of the MTP draft's output head (#31037 port); production uses 65536 |
@@ -181,4 +185,4 @@ top of the 2026-10-24 code.
 `deploy/qwen38-mtp-tune`, `fix/mmq-oob-29953`, `fix/multigpu-mixed-arch-mmf-gemm` and
 `fix/cohere2moe-mixedarch-router-mmvf`.
 
-`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing. `exp/moe-sum` = `exp/moe-n1` + #25952 + the decode-form matcher (deployed 2026-10-26). `exp/qwen-q5k` = `exp/moe-sum` + the branchless Q4_K/Q5_K unpack, the cross-type q8 cache and the two multi-token fusions (deployed 2026-10-26 as `app-7f2bd32`). `exp/small-fusions` = `exp/qwen-q5k` + narrow CONCAT, batched CPY and ADD → RMS_NORM → MUL (deployed 2026-10-26 as `app-6224105`). `exp/rope-q8-setrows` = `exp/small-fusions` + the q8_0 rope fusion, two-entry quantize cache and residual-add folding (deployed 2026-10-27 as `app-e7b5abb`). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
+`exp/moe-n1` = `deploy/rocm101-stack` + the single-token MoE routing. `exp/moe-sum` = `exp/moe-n1` + #25952 + the decode-form matcher (deployed 2026-10-26). `exp/qwen-q5k` = `exp/moe-sum` + the branchless Q4_K/Q5_K unpack, the cross-type q8 cache and the two multi-token fusions (deployed 2026-10-26 as `app-7f2bd32`). `exp/small-fusions` = `exp/qwen-q5k` + narrow CONCAT, batched CPY and ADD → RMS_NORM → MUL (deployed 2026-10-26 as `app-6224105`). `exp/rope-q8-setrows` = `exp/small-fusions` + the q8_0 rope fusion, two-entry quantize cache and residual-add folding (deployed 2026-10-27 as `app-e7b5abb`). `exp/router-mmvf` = `exp/rope-q8-setrows` + the RDNA4 mmvf block size, unrolled f32 loads and the unit logit-scale skip (deployed 2026-10-27 as `app-ce88c8c`). Rejected experiments: `exp/cp-batch2a`, `exp/cp-batch2b`, `exp/cp-batch3`, `exp/mmq-glu-fusion-28702`.
