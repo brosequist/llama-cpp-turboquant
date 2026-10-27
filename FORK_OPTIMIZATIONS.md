@@ -8,26 +8,26 @@ process**, serving through llama-swap in a k3s cluster.
 |---|---|
 | GPUs | RX 9070 XT (navi48, gfx1201, 16 GB), plus RX 9060 XT (navi44, gfx1200, 16 GB, half the memory bandwidth) |
 | Host | Ryzen 9 7900X, Ubuntu with the in-tree amdgpu driver (kernel 7.0) |
-| Main model | Qwen3.8-27B IQ4_XS (`qwen35` arch: hybrid GDN + attention, MTP head). 262K context, turbo4 KV, layer split across both GPUs (`--tensor-split 1.3,1`) |
-| Second dual-GPU model | North-Mini-Code-1.0 UD-Q4_K_XL (`cohere2moe`). 262K context, q8_0 KV, `--device ROCm1,ROCm0 --tensor-split 1,1` |
+| Main model | Qwen3.8-27B IQ4_XS (`qwen35` arch: hybrid GDN + attention, MTP head). 262K context, turbo4 KV, layer split across both GPUs (`--device ROCm1,ROCm0 --tensor-split 1,1.4`, so the output layer and MTP head sit on navi48) |
+| Second dual-GPU model | North-Mini-Code-1.0 UD-Q4_K_XL (`cohere2moe`). 262K context, q8_0 KV, `--device ROCm1,ROCm0 --tensor-split 1,1.4` |
 
 ## Overall: before vs after
 
 Qwen3.8-27B with the production flags. **Before** is `rocm-1186790` / `rocm-8dc12a0`, deployed 2026-10-24 before
-this work, without MTP. **After** is `exp/rope-q8-setrows` (deployed 2026-10-27 as `app-e7b5abb`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--tensor-split 1.3,1`,
+this work, without MTP. **After** is `exp/rope-q8-setrows` (deployed 2026-10-27 as `app-e7b5abb`: `deploy/rocm101-stack` + the MoE and decode kernel work below) plus the navi48 clock watcher and `--device ROCm1,ROCm0 --tensor-split 1,1.4` (the rog desktop moved to the iGPU on 2026-10-26, freeing navi48),
 measured back to back under the same GPU conditions (see the note on navi48 clocks below).
 
 | Metric | Before | After | Change |
 |---|---:|---:|---:|
-| Decode, code prompt (t/s) | ~21 (no speculation) | **54.8** | **~2.6×** |
-| Decode, prose prompt (t/s) | ~21 | **42.2** | ~2.0× |
-| Decode, 9.3K-token summarisation (t/s) | ~21 | **42.1** | ~2.0× |
-| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **1711** (`-b 4096 -ub 256`) | ~2.1× |
-| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **~1450** | ~1.9× |
+| Decode, code prompt (t/s) | ~21 (no speculation) | **57.0** | **~2.7×** |
+| Decode, prose prompt (t/s) | ~21 | **43.8** | ~2.1× |
+| Decode, 9.3K-token summarisation (t/s) | ~21 | **45.0** | ~2.1× |
+| Prefill, 4096-token prompt (`llama-bench pp4096`, t/s) | 808 | **1711** (`-b 4096 -ub 256`, measured at `--tensor-split 1.3,1`) | ~2.1× |
+| Prefill, 9.3K-token prompt through llama-server with MTP (t/s) | 754 | **~1390** (~1450 at `1.3,1`) | ~1.8× |
 | Prefill @ 64K context depth (t/s) | 223 | 492 | 2.2× |
 | Prefill @ 224K context depth (t/s) | 152 | 383 | 2.5× |
 | KL divergence vs f16 KV (turbo4) | 0.0080 | 0.0065 | lower is better |
-| VRAM, navi44 / navi48 (GB) | 14.3 / 10.8 (unbalanced) | 13.1 / 13.4 | balanced; ~2.7 GB headroom each |
+| VRAM peak, navi44 / navi48 (GB) | 14.3 / 10.8 | 10.2 / 16.0 | navi48 now fills on purpose; it no longer drives the desktop |
 
 North-Mini-Code decode with the q8_0 KV cache (long-context rows: `llama-bench tg64`; edit/fresh rows: llama-server, temp 0).
 
@@ -100,8 +100,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 | **`--spec-type ngram-simple` on North-Mini-Code**: draft-free n-gram speculation. North has no MTP head and the only EAGLE3 draft doesn't load in this fork | North: code edit / fresh code | 57.1 / 58.4 | 139.9 / 58.0 |
 | **Single-token MUL_MAT_ID through the MoE MMVQ kernel on RDNA4** (ours, `exp/moe-n1`, deployed 2026-10-26). A rocprofv3 profile of North's fresh-code decode showed the expert matmuls taking ~45% of GPU time at ~100 GB/s: the generic `mul_mat_vec_q` runs 8 warps per output row on RDNA4, so North's short expert rows (Q5_K down K = 768, Q4_K gate/up K = 2048) leave most lanes idle. One-token calls now use the fork's dedicated `mul_mat_vec_q_moe` kernel (one warp per 2 rows per expert slot), which already served 2–8 tokens, including its fused SwiGLU gate/up form. Microbenchmark on navi48: Q5_K down 146 → 86 µs, Q4_K gate/up 86 → 65 µs (navi44 flat). `GGML_CUDA_MMVQ_MOE_N1=0` restores the old routing. Only MoE models are affected; Qwen3.8 is dense | North: code edit (first 1200 tokens) / fresh code | 163.7 / 58.2 | 180.8 / 73.3 |
 | **Fused decode MoE expert sum** (ours on top of [#25952](https://github.com/ggml-org/llama.cpp/pull/25952), `exp/moe-sum`, deployed 2026-10-26). For one token the graph sums the weighted expert outputs as mul → cont(permute) → sum_rows, and on navi44 sum_rows alone cost 10–12 µs per layer. A new matcher recognises that 4-node form and runs it through #25952's weighted-reduction kernel. `GGML_CUDA_MOE_WEIGHTED_REDUCTION=0` disables both forms. Summation order changes, so output text can differ slightly | North `llama-bench tg128`, empty / 16K context | 74.7 / 68.5 | 79.4 / 71.6 |
-| **`--device ROCm1,ROCm0` for North** (launch flag). North ties its output layer to the token embedding (570 MB), and llama.cpp puts it on the last device. With the default order that is navi44, where it costs 1.8 ms per token. Reversing the order moves it to navi48; the split ratio follows the device list. VRAM peak 13.9 GB navi44 / 14.4 GB navi48. Rejected for Qwen3.8: it either fills navi48 or costs 17% prefill | North `llama-bench tg128`, empty / 16K context; llama-server fresh code | 79.4 / 71.6; 73.3 | 83.3 / 74.0; **80.9** |
-| **`--tensor-split 1.3,1`** for Qwen3.8 (was 1.2,1), re-tuned after the GDN kernel, `-b 8192`, the clock watcher and the new build. 1.1 / 1.4: 1334 / 1482 prefill, but 1.4 lost short-prompt prefill (254 → 188); `-ub` 384 / 512 were slower than 256. North stays at `1,1`: 1.4,1 gains ~3% on fresh code but leaves navi48 ~0.4 GB free, and navi48 also drives the desktop | summary / code / prose; 9.3K prefill | 38.9 / 51.5 / 41.0; 1371 | 39.3 / 52.1 / 41.5; 1451 |
+| **`--device ROCm1,ROCm0` for North** (launch flag). North ties its output layer to the token embedding (570 MB), and llama.cpp puts it on the last device. With the default order that is navi44, where it costs 1.8 ms per token. Reversing the order moves it to navi48; the split ratio follows the device list. VRAM peak 13.9 GB navi44 / 14.4 GB navi48. At the time it was rejected for Qwen3.8 (it filled navi48 or cost 17% prefill); see the 2026-10-27 row below | North `llama-bench tg128`, empty / 16K context; llama-server fresh code | 79.4 / 71.6; 73.3 | 83.3 / 74.0; **80.9** |
+| **`--tensor-split 1.3,1`** for Qwen3.8 (was 1.2,1), re-tuned after the GDN kernel, `-b 8192`, the clock watcher and the new build. 1.1 / 1.4: 1334 / 1482 prefill, but 1.4 lost short-prompt prefill (254 → 188); `-ub` 384 / 512 were slower than 256. North stayed at `1,1` then: 1.4,1 gained ~3% on fresh code but left navi48 ~0.4 GB free while it drove the desktop (superseded below) | summary / code / prose; 9.3K prefill | 38.9 / 51.5 / 41.0; 1371 | 39.3 / 52.1 / 41.5; 1451 |
 | **Branchless Q4_K/Q5_K scale unpack in mmvq** (vecdotq part of [#26705](https://github.com/ggml-org/llama.cpp/pull/26705), `exp/qwen-q5k`, deployed 2026-10-26 as `app-7f2bd32`). A rocprofv3 profile of Qwen3.8 decode showed the weight matmuls already at 91–96% of bandwidth except Q5_K at the 4-column MTP verify width: 48% on navi48, 62% on navi44, because the scale unpack branched on `j` and re-ran for every column. The compiler now hoists it | Qwen3.8 + MTP: summary / code / prose | 39.3 / 52.1 / 41.5 | 41.9 / 54.6 / 42.1 |
 | **q8_1 quantize cache shared across weight types** (ours, `exp/qwen-q5k`). The cache was keyed on the weight type, which the q8_1 layout doesn't depend on, so Qwen3.8's Q5_K + IQ4_XS projections on one input each re-quantized it (~80 launches per token). Outputs token-identical | Qwen3.8 + MTP: summary / code / prose | 41.9 / 54.6 / 42.1 | 42.1 / 54.8 / 42.3 |
 | **Gate/up + GLU fused for 2–4-token batches on RDNA4, and row-broadcast operands in the elementwise chain** (ours, `exp/qwen-q5k`). MTP verify batches ran gate, up and GLU as three kernels, and GDN's ADD → SOFTPLUS → MUL as three. `GGML_CUDA_MMVQ_FUSE_NCOLS=0` disables the first. Outputs token-identical | Qwen3.8 + MTP: summary / code / prose | 42.1 / 54.8 / 42.3 | 42.2 / 54.9 / 42.4 |
@@ -109,6 +109,8 @@ faster (pp4096 1606 vs 1544 t/s without it). `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND
 
 | **Merged Q/K/V weights for North** (model file, not fork code, deployed 2026-10-27). The GGUF ships `attn_q`, `attn_k` and `attn_v` as separate tensors, so every layer ran three matmuls on the same input. An offline rewrite stacks them into one `attn_qkv` tensor per layer (rows Q\|K\|V, bytes copied unchanged), which the `cohere2moe` loader already accepts. `GGML_CUDA_GRAPH_OPT=1` asserts with the merged file, so leave it off | North `llama-bench tg128`, empty context | 82.8 | 85.2 |
 | **North decode kernel cuts** (ours, `exp/rope-q8-setrows`, deployed 2026-10-27 as `app-e7b5abb`). A rocprofv3 trace of North decode showed the GPUs 66% busy, with 28% lost to launch gaps, so this removes launches. (1) K's rope writes straight into the q8_0 KV cache: the existing ROPE + VIEW + SET_ROWS fusion only handled f16/f32 caches, and never fired on North because its iswa graph put the V view between them (now K is expanded last). `GGML_CUDA_ROPE_Q8_FUSE=0` disables. (2) The q8_1 quantize cache holds two entries and also serves MUL_MAT_ID, so the MoE gate/up reuse the quantization of `attn_norm` made for QKV (North's attention and MoE run in parallel off the same norm). (3) Both residual ADDs fold into the MoE weighted reduction; when its output aliases recycled expert memory, a single-block staged variant runs instead (`GGML_CUDA_MOE_WR_ADDS=0` disables). The rope fusion rounds differently in the last bit; against an f16 KV cache it is as close as before (KLD 0.0081 vs 0.0084). Qwen3.8 output token-identical, decode +0.5% | North llama-server fresh code; 9K-context decode | 85.2; 79.1 | 88.2; 81.7 |
+| **Output layer on navi48 for Qwen3.8; more North layers on navi48** (launch flags, 2026-10-27). Once the rog desktop moved to the iGPU, navi48 had the headroom: Qwen3.8 now runs `--device ROCm1,ROCm0 --tensor-split 1,1.4`, which puts its 1 GB Q6_K output layer and the MTP draft head on the faster card (VRAM peak 10.2 GB navi44 / 16.0 GB navi48; pinning only `output.weight` with `-ot` instead halved prefill). North moved from `1,1` to `1,1.4`: fresh code 80.2 → 82.2, prefill +2% | Qwen3.8 + MTP: summary / code / prose; 9.3K prefill | 43.0 / 55.9 / 43.1; 1464 | 45.0 / 57.0 / 43.8; 1389 |
+
 ### Mainline cherry-picks (batch 1: correctness and security)
 
 [#28198](https://github.com/ggml-org/llama.cpp/pull/28198) (concurrent streams per split on multi-GPU), [#28475](https://github.com/ggml-org/llama.cpp/pull/28475) (races in mmid/mmf), [#28068](https://github.com/ggml-org/llama.cpp/pull/28068) (GDN q/k l2-norm matches FLA:
