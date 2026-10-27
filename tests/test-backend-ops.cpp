@@ -6656,11 +6656,13 @@ struct test_moe_weighted_reduction : public test_case {
 struct test_moe_weighted_sum_rows : public test_case {
     const int64_t n_embd;
     const int64_t n_expert_used;
+    const int     n_adds; // residual ADDs after the sum (cohere2moe: + inpL + attn_out), folded into the kernel
 
-    test_moe_weighted_sum_rows(int64_t n_embd, int64_t n_expert_used) : n_embd(n_embd), n_expert_used(n_expert_used) {}
+    test_moe_weighted_sum_rows(int64_t n_embd, int64_t n_expert_used, int n_adds = 0)
+        : n_embd(n_embd), n_expert_used(n_expert_used), n_adds(n_adds) {}
 
     std::string vars() override {
-        return VARS_TO_STR2(n_embd, n_expert_used);
+        return VARS_TO_STR3(n_embd, n_expert_used, n_adds);
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6680,6 +6682,11 @@ struct test_moe_weighted_sum_rows : public test_case {
         ggml_tensor * weighted = ggml_mul(ctx, experts, weights);
         ggml_tensor * pe       = ggml_cont(ctx, ggml_permute(ctx, weighted, 1, 0, 2, 3));
         ggml_tensor * out      = ggml_reshape_2d(ctx, ggml_sum_rows(ctx, pe), n_embd, 1);
+        for (int k = 0; k < n_adds; ++k) {
+            ggml_tensor * res = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, 1);
+            ggml_set_name(res, k == 0 ? "residual0" : "residual1");
+            out = k == 0 ? ggml_add(ctx, out, res) : ggml_add(ctx, res, out);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -11229,6 +11236,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_weighted_sum_rows(2048, 8));
     test_cases.emplace_back(new test_moe_weighted_sum_rows(63, 2));
     test_cases.emplace_back(new test_moe_weighted_sum_rows(4096, 15));
+    for (int n_adds : {1, 2}) {
+        test_cases.emplace_back(new test_moe_weighted_sum_rows(2048, 8, n_adds));
+        test_cases.emplace_back(new test_moe_weighted_sum_rows(63, 2, n_adds));
+    }
     // fork: north decode + n-gram verify batches (n_embd 2048, k 8)
     for (int64_t nt : {1, 2, 4, 8}) {
         test_cases.emplace_back(new test_moe_weighted_reduction(2048, 8, nt));

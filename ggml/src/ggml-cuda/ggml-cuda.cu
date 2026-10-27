@@ -750,9 +750,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         }
     };
 
-    free_buf(q8_cache.ptr, q8_cache.dev);
-    for (const auto & r : q8_cache.retired) {
-        free_buf(r.ptr, r.dev);
+    for (auto & qc : q8_cache) {
+        free_buf(qc.ptr, qc.dev);
+        for (const auto & r : qc.retired) {
+            free_buf(r.ptr, r.dev);
+        }
     }
     free_buf(tq_rot_cache.ptr, tq_rot_cache.dev);
     for (const auto & r : tq_rot_cache.retired) {
@@ -775,8 +777,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
         free_buf((char *) s.n_miss,      s.dev);
     }
 
-    q8_cache.ptr = nullptr;
-    q8_cache.retired.clear();
+    for (auto & qc : q8_cache) {
+        qc.ptr = nullptr;
+        qc.retired.clear();
+    }
     tq_rot_cache.ptr = nullptr;
     tq_rot_cache.retired.clear();
     moe_tables.clear();
@@ -5222,6 +5226,55 @@ static int ggml_cuda_fuse_elem_chain(ggml_backend_cuda_context & ctx, const ggml
     return -1;
 }
 
+// fork: residual ADDs right after a fused MoE weighted reduction (cohere2moe's parallel block:
+// l_out = moe_out + inpL + attn_out) fold into the reduction kernel. Walks no-op RESHAPE/VIEWs of
+// the running value and up to two same-shape contiguous f32 ADDs; returns the extended node count
+// (node_count when nothing folds) and the addends in graph order. GGML_CUDA_MOE_WR_ADDS=0 disables.
+static int ggml_cuda_moe_wr_fold_adds(const ggml_cgraph * cgraph, int node_idx, int node_count,
+                                      const ggml_tensor * red_dst, const ggml_tensor * adds[2], ggml_tensor *& add_dst) {
+    static const bool off = getenv("GGML_CUDA_MOE_WR_ADDS") != nullptr && std::atoi(getenv("GGML_CUDA_MOE_WR_ADDS")) == 0;
+    if (off) {
+        return node_count;
+    }
+    const ggml_tensor * cur = red_dst;
+    int n_add = 0;
+    int commit = node_count;
+    for (int j = node_idx + node_count; j < cgraph->n_nodes && n_add < 2; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if ((n->op == GGML_OP_RESHAPE || n->op == GGML_OP_VIEW) && n->src[0] == cur && ggml_is_contiguous(n) &&
+                n->data == cur->data && ggml_nelements(n) == ggml_nelements(cur)) {
+            cur = n;
+            continue;
+        }
+        if (n->op != GGML_OP_ADD || n->type != GGML_TYPE_F32 || !ggml_is_contiguous(n)) {
+            break;
+        }
+        const ggml_tensor * other = n->src[0] == cur ? n->src[1] : (n->src[1] == cur ? n->src[0] : nullptr);
+        if (other == nullptr || other == cur || other->type != GGML_TYPE_F32 || !ggml_is_contiguous(other) ||
+                !ggml_are_same_shape(other, n) || !ggml_are_same_shape(cur, n)) {
+            break;
+        }
+        adds[n_add++] = other;
+        add_dst = n;
+        cur = n;
+        commit = j - node_idx + 1;
+    }
+    if (n_add == 0) {
+        return node_count;
+    }
+    std::vector<ggml_op> ops(commit);
+    for (int k = 0; k < commit; ++k) {
+        ops[k] = cgraph->nodes[node_idx + k]->op;
+    }
+    const int out_idx = node_idx + commit - 1;
+    if (!ggml_can_fuse_subgraph(cgraph, node_idx, commit, ops.data(), &out_idx, 1)) {
+        adds[0] = adds[1] = nullptr;
+        add_dst = nullptr;
+        return node_count;
+    }
+    return commit;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5239,6 +5292,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match) ||
                 ggml_cuda_match_moe_weighted_sum_rows(cgraph, i, match)) {
+            // Fold up to two following residual ADDs (cohere2moe: moe_out + inpL + attn_out).
+            const ggml_tensor * adds[2] = { nullptr, nullptr };
+            ggml_tensor *       add_dst = nullptr;
+            const int           n_ext   = ggml_cuda_moe_wr_fold_adds(cgraph, i, match.node_count, match.dst, adds, add_dst);
+            if (n_ext > match.node_count) {
+                const int ext_out = i + n_ext - 1;
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, n_ext, &ext_out, 1)) {
+                    ggml_cuda_op_moe_weighted_reduction(
+                        *cuda_ctx, match.experts, match.expert_scale, match.weights, add_dst, adds[0], adds[1]);
+                    cuda_ctx->fusion_stats.moe_weighted_reduction++;
+                    return n_ext - 1;
+                }
+            }
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
