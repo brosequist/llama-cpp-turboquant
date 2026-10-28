@@ -151,6 +151,26 @@ performance-neutral: pp4096 1606 → 1611, and decode is within run-to-run noise
 | `--backend-sampling` for North | Doesn't engage either: no TOP_K / ARGSORT on this ROCm build, and llama-server turns it off under speculation (`ngram-simple`) |
 | EAGLE3 draft for North (community GGUF) | Doesn't load: TheTom's EAGLE3 loader predates mainline's (`extract_layers` key, full d2t matrix). Real-world acceptance of that draft is ~1.28 anyway |
 
+## Upstream contributions
+
+- **[TheTom/llama-cpp-turboquant#410](https://github.com/TheTom/llama-cpp-turboquant/pull/410)** (opened 2026-10-28):
+  24 of the items above, rebased onto TheTom's head `643956891` (branch `pr/rdna4-decode-fusions-v2`). Against that
+  head: North `tg128` 59.5 -> 84.1 t/s (+41%), Qwen3.8 `pp4096` 2.1x, full `test-backend-ops` on both cards. The first
+  review asked for three changes, prepared as three follow-up commits:
+  - the chunked mmf/mmvf fallback is limited to HIP builds. On CUDA it also fired for mixed NVIDIA archs (e.g. a 3090
+    next to a 4090), where cuBLAS has no cross-arch problem and the 16-column slicing would cost prefill;
+  - the q8_0 rope + SET_ROWS fusion requires `n_dims % 64 == 0`. With partial rotary (`n_dims` = 32, 96, ...) a 32-wide
+    CUDA warp split between the rotated and pass-through branches, which reach the scale shuffle from different call
+    sites under a full mask;
+  - `LLAMA_MTP_PROF` is dropped from the PR (instrumentation only).
+
+  None of the three changes behaviour on this setup: the build is HIP, North's rope covers all 128 head dims, and the
+  profiling knob is off by default.
+- **ggml-org/llama.cpp**: the single-token MoE MMVQ routing (`GGML_CUDA_MMVQ_MOE_N1`) ports to mainline as a one-line
+  dispatch change in `mmvq.cu`, since mainline's MoE kernel already handles every fused form. On mainline: Gemma 4
+  26B-A4B `tg128` +13.7% (RX 9070 XT) / +13.8% (RX 9060 XT), North +15.9% (+12.0% at 16K context); prompt processing
+  unchanged.
+
 ## Environment knobs added by this fork
 
 Every behaviour change below can be turned off at run time, which is how each one was A/B'd.
@@ -169,7 +189,7 @@ Every behaviour change below can be turned off at run time, which is how each on
 | `GGML_CUDA_NO_MIXED_ARCH_WORKAROUND=1` | off | Skips the chunked mmf/mmvf routing for mixed-arch GEMMs and uses rocBLAS (needs ROCm ≥ 7.12; slower here) |
 | `GGML_CUDA_GDN_LEGACY=1` | off | Uses the original column-per-thread GATED_DELTA_NET kernel instead of the row-per-warp port |
 | `LLAMA_MTP_DRAFT_VOCAB=<rows>` | off | Keeps only the first rows of the MTP draft's output head (#31037 port); production uses 65536 |
-| `LLAMA_MTP_PROF=1` | off | Logs per-batch target decode vs MTP `process()` / draft time (adds syncs) |
+| `LLAMA_MTP_PROF=1` | off | Logs per-batch target decode vs MTP `process()` / draft time (adds syncs). Not in the TheTom PR |
 
 TheTom's own knobs (`GGML_CUDA_Q8CACHE`, `GGML_CUDA_FUSE_CHAIN`, `TURBO_*`, …) are listed in AGENTS.md.
 
